@@ -56,6 +56,44 @@ std::vector<std::byte> readFile(const fs::path& path) {
     return bytes;
 }
 
+std::string expandShaderIncludes(const fs::path& path, const fs::path& root,
+                                 std::vector<fs::path> stack = {}) {
+    const fs::path canonical = fs::weakly_canonical(path);
+    if (std::find(stack.begin(), stack.end(), canonical) != stack.end()) {
+        throw std::runtime_error("cyclic shader include: " + canonical.string());
+    }
+    stack.push_back(canonical);
+
+    std::ifstream file(canonical, std::ios::binary);
+    if (!file) throw std::runtime_error("cannot open shader " + canonical.string());
+
+    std::string expanded;
+    std::string line;
+    while (std::getline(file, line)) {
+        const size_t start = line.find_first_not_of(" \t");
+        const std::string_view directive =
+            start == std::string::npos ? std::string_view{} : std::string_view(line).substr(start);
+        if (!directive.starts_with("#include")) {
+            expanded += line + '\n';
+            continue;
+        }
+
+        const size_t open = line.find_first_of("\"<", start + 8);
+        const char closeChar = open != std::string::npos && line[open] == '<' ? '>' : '"';
+        const size_t close = open == std::string::npos ? std::string::npos : line.find(closeChar, open + 1);
+        if (close == std::string::npos) {
+            throw std::runtime_error("invalid shader include in " + canonical.string());
+        }
+
+        const fs::path includeName = line.substr(open + 1, close - open - 1);
+        const fs::path includePath = includeName.has_root_directory()
+            ? root / includeName.relative_path()
+            : canonical.parent_path() / includeName;
+        expanded += expandShaderIncludes(includePath, root, stack);
+    }
+    return expanded;
+}
+
 std::string trim(std::string value) {
     const auto first = value.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return {};
@@ -639,9 +677,7 @@ private:
 
     bool compilePipeline(const fs::path& path, bool hdr, VkPipeline& result) {
         try {
-            std::ifstream shader(path, std::ios::binary);
-            if (!shader) throw std::runtime_error("cannot open shader " + path.string());
-            const std::string source((std::istreambuf_iterator<char>(shader)), std::istreambuf_iterator<char>());
+            const std::string source = expandShaderIncludes(path, path.parent_path());
             std::ofstream composite(tempSource_, std::ios::binary | std::ios::trunc);
             composite << "#version 460\n";
             composite << (hdr ? "#define DRT_BENCH_HDR 1\n" : "#define DRT_BENCH_SDR 1\n");
@@ -1035,6 +1071,25 @@ int selfTest() {
     const auto now = Clock::now();
     if (shaderReloadReady(true, now - 2s, now - 10ms, now)) {
         std::cerr << "self-test failed: shader reloaded before one second of file stability\n";
+        return 1;
+    }
+
+    const fs::path includeRoot = fs::temp_directory_path() /
+        ("drt-bench-include-test-" + std::to_string(GetCurrentProcessId()));
+    fs::create_directories(includeRoot / "local");
+    {
+        std::ofstream(includeRoot / "root.glsl") << "float rootValue = 1.0;\n";
+        std::ofstream(includeRoot / "local" / "nested.glsl") <<
+            "#include \"/root.glsl\"\nfloat nestedValue = rootValue;\n";
+        std::ofstream(includeRoot / "entry.glsl") << "#include \"local/nested.glsl\"\n";
+    }
+    const std::string expanded = expandShaderIncludes(includeRoot / "entry.glsl", includeRoot);
+    std::error_code includeError;
+    fs::remove_all(includeRoot, includeError);
+    if (expanded.find("#include") != std::string::npos ||
+        expanded.find("rootValue") == std::string::npos ||
+        expanded.find("nestedValue") == std::string::npos) {
+        std::cerr << "self-test failed: shader includes were not expanded\n";
         return 1;
     }
 

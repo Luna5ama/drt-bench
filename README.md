@@ -51,3 +51,14 @@ layout(set = 0, binding = 1) uniform writeonly image2D uimg_outputTex;
 The shader supplies `main()`. `usam_inputTex` uses linear filtering with clamp-to-edge addressing. `uimg_outputTex` is the acquired swapchain image, so `imageSize(uimg_outputTex)` is the window size. In HDR10 mode the shader should write display-ready ST.2084 values.
 
 After `/loaddrt`, the source file is polled for changes. Successful recompiles redraw immediately; failed recompiles keep the last working pipeline. Reload attempts are separated by at least one second.
+
+## Alpha-Piscium DRT
+
+`shaders\alpha-piscium-drt.glsl` accepts linear ACES AP0 input only. Set `DRT_BENCH_DRT` to `0` for AgX, `1` for OpenDRT, or `2` for Skibidi.
+
+```text
+/loaddrt shaders\alpha-piscium-drt.glsl
+/loadexr <path>
+```
+
+The copied AgX, OpenDRT, and Skibidi core files are intentionally byte-for-byte unchanged; compatibility code lives outside them. For HDR, output bridges the cores' sRGB through linear Rec. 2020 to ST 2084, using 203 nits as SDR white.
