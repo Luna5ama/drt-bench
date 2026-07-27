@@ -234,11 +234,13 @@ vec3 drt_openDRT(vec3 color) {
     color = saturate(rgb);
     color = colors2_oetf(COLORS2_OUTPUT_TF, color);
 
+    #if USE_LOOK
     const mat3 agx_mat = mat3(
         0.842479062253094, 0.0423282422610123, 0.0423756549057051,
         0.0784335999999992, 0.878468636469772, 0.0784336,
         0.0792237451477643, 0.0791661274605434, 0.879142973793104
     );
+    color = agx_mat * color;
 
     vec3 offset = vec3(SETTING_OPENDRT_LOOK_OFFSET_R, SETTING_OPENDRT_LOOK_OFFSET_G, SETTING_OPENDRT_LOOK_OFFSET_B);
     vec3 slope = vec3(SETTING_OPENDRT_LOOK_SLOPE_R, SETTING_OPENDRT_LOOK_SLOPE_G, SETTING_OPENDRT_LOOK_SLOPE_B);
@@ -255,6 +257,7 @@ vec3 drt_openDRT(vec3 color) {
     color = agx_mat_inv * color;
 
     color = saturate(color);
+    #endif
 
     return color;
 }
