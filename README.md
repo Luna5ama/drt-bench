@@ -27,7 +27,7 @@ current DRT shader, and F6 toggles SDR/HDR.
 /loadexr <path>
 /loadfp16 <path>
 /loadfp32 <path>
-/loaddrt <path>
+/loaddrt <directory>
 /sdr
 /hdr
 /screenshot
@@ -59,14 +59,14 @@ layout(set = 0, binding = 1) uniform writeonly image2D uimg_outputTex;
 
 The shader supplies `main()`. `usam_inputTex` uses linear filtering with clamp-to-edge addressing. `uimg_outputTex` is the acquired swapchain image, so `imageSize(uimg_outputTex)` is the window size. In HDR10 mode the shader should write display-ready ST.2084 values.
 
-After `/loaddrt`, the source file is polled for changes. Successful recompiles redraw immediately; failed recompiles keep the last working pipeline. Reload attempts are separated by at least one second.
+`/loaddrt` loads `<directory>/main.glsl` as the entry point and watches every file below that directory, including includes. Changes are debounced for 100ms; after a reload completes, the next reload waits at least 500ms. Successful recompiles redraw immediately; failed recompiles keep the last working pipeline.
 
 ## Alpha-Piscium DRT
 
 `shaders\alpha-piscium-drt.glsl` accepts linear ACES AP0 input only. Set `DRT_BENCH_DRT` to `0` for AgX, `1` for OpenDRT, or `2` for Skibidi.
 
 ```text
-/loaddrt shaders\alpha-piscium-drt.glsl
+/loaddrt shaders
 /loadexr <path>
 ```
 

@@ -35,9 +35,31 @@ namespace {
 constexpr UINT kCommandMessage = WM_APP + 1;
 using Clock = std::chrono::steady_clock;
 
-bool shaderReloadReady(bool pending, Clock::time_point lastAttempt,
+bool shaderReloadReady(bool pending, Clock::time_point lastReload,
                        Clock::time_point lastChange, Clock::time_point now) {
-    return pending && now - lastAttempt >= 1s && now - lastChange >= 1s;
+    return pending && now - lastReload >= 500ms && now - lastChange >= 100ms;
+}
+
+using ShaderFileSnapshot = std::vector<std::pair<fs::path, fs::file_time_type>>;
+
+ShaderFileSnapshot shaderFileSnapshot(const fs::path& directory) {
+    std::error_code error;
+    if (!fs::is_directory(directory, error) || error) {
+        throw std::runtime_error("DRT shader directory does not exist: " + directory.string());
+    }
+    ShaderFileSnapshot files;
+    for (fs::recursive_directory_iterator it(directory, fs::directory_options::skip_permission_denied, error), end;
+         it != end; it.increment(error)) {
+        if (error) throw std::runtime_error("cannot scan DRT shader directory: " + directory.string());
+        if (!it->is_regular_file(error)) continue;
+        const auto write = fs::last_write_time(it->path(), error);
+        if (error) throw std::runtime_error("cannot read DRT shader timestamp: " + it->path().string());
+        files.emplace_back(it->path().lexically_normal(), write);
+    }
+    std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
+        return left.first.native() < right.first.native();
+    });
+    return files;
 }
 
 const char* vkFormatName(VkFormat format) {
@@ -960,19 +982,16 @@ private:
 
     bool loadShader(const fs::path& path, bool force) {
         const auto now = std::chrono::steady_clock::now();
-        if (!force && pipeline_ && now - lastReloadAttempt_ < 1s) {
-            shaderPath_ = fs::absolute(path);
+        if (!force && pipeline_ && now - lastShaderReload_ < 500ms) {
             shaderReloadPending_ = true;
-            lastShaderChange_ = now;
-            std::cout << "shader reload queued (1 second cooldown)\n";
+            std::cout << "shader reload queued (500ms cooldown)\n";
             return true;
         }
         VkPipeline replacement = VK_NULL_HANDLE;
-        lastReloadAttempt_ = now;
         shaderPath_ = fs::absolute(path);
-        std::error_code ignored;
-        observedShaderWrite_ = fs::last_write_time(shaderPath_, ignored);
-        if (!compilePipeline(shaderPath_, hdr_, replacement)) return false;
+        const bool compiled = compilePipeline(shaderPath_, hdr_, replacement);
+        lastShaderReload_ = std::chrono::steady_clock::now();
+        if (!compiled) return false;
         vkDeviceWaitIdle(device_);
         if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
         pipeline_ = replacement;
@@ -983,16 +1002,15 @@ private:
     }
 
     void pollShader() {
-        if (shaderPath_.empty()) return;
-        std::error_code error;
-        const auto write = fs::last_write_time(shaderPath_, error);
-        if (!error && write != observedShaderWrite_) {
-            observedShaderWrite_ = write;
-            shaderReloadPending_ = true;
-            lastShaderChange_ = std::chrono::steady_clock::now();
-        }
+        if (shaderDirectory_.empty()) return;
+        const auto files = shaderFileSnapshot(shaderDirectory_);
         const auto now = std::chrono::steady_clock::now();
-        if (shaderReloadReady(shaderReloadPending_, lastReloadAttempt_, lastShaderChange_, now)) {
+        if (files != observedShaderFiles_) {
+            observedShaderFiles_ = files;
+            shaderReloadPending_ = true;
+            lastShaderChange_ = now;
+        }
+        if (shaderReloadReady(shaderReloadPending_, lastShaderReload_, lastShaderChange_, now)) {
             loadShader(shaderPath_, true);
         }
     }
@@ -1265,8 +1283,8 @@ private:
                 } else if (command == "/loadfp32") {
                     loadRaw(argument, 4, VK_FORMAT_R32G32B32A32_SFLOAT);
                 } else if (command == "/loaddrt") {
-                    if (argument.empty()) throw std::runtime_error("usage: /loaddrt <path>");
-                    loadShader(pathFromUtf8(argument), false);
+                    if (argument.empty()) throw std::runtime_error("usage: /loaddrt <directory>");
+                    loadShaderDirectory(pathFromUtf8(argument));
                 } else if (command == "/sdr") {
                     setHdr(false);
                 } else if (command == "/hdr") {
@@ -1293,6 +1311,17 @@ private:
                           SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) {
             throw std::runtime_error("SetWindowPos failed");
         }
+    }
+
+    void loadShaderDirectory(const fs::path& directory) {
+        shaderDirectory_ = fs::absolute(directory);
+        shaderPath_ = shaderDirectory_ / "main.glsl";
+        std::error_code error;
+        if (!fs::is_regular_file(shaderPath_, error) || error) {
+            throw std::runtime_error("DRT shader entry point is missing: " + shaderPath_.string());
+        }
+        observedShaderFiles_ = shaderFileSnapshot(shaderDirectory_);
+        loadShader(shaderPath_, true);
     }
 
     void processHotkeys() {
@@ -1425,8 +1454,9 @@ private:
 
     fs::path executableDir_;
     fs::path shaderPath_;
-    fs::file_time_type observedShaderWrite_{};
-    std::chrono::steady_clock::time_point lastReloadAttempt_{};
+    fs::path shaderDirectory_;
+    ShaderFileSnapshot observedShaderFiles_;
+    std::chrono::steady_clock::time_point lastShaderReload_{};
     std::chrono::steady_clock::time_point lastShaderChange_{};
     bool shaderReloadPending_ = false;
     fs::path tempSource_ =
@@ -1469,8 +1499,10 @@ int selfTest() {
     const size_t fp32Bytes = static_cast<size_t>(width) * height * 4 * 4;
     if (fp16Bytes != 7'372'800 || fp32Bytes != 14'745'600) return 1;
     const auto now = Clock::now();
-    if (shaderReloadReady(true, now - 2s, now - 10ms, now)) {
-        std::cerr << "self-test failed: shader reloaded before one second of file stability\n";
+    if (shaderReloadReady(true, now - 500ms, now - 99ms, now) ||
+        shaderReloadReady(true, now - 499ms, now - 1s, now) ||
+        !shaderReloadReady(true, now - 500ms, now - 100ms, now)) {
+        std::cerr << "self-test failed: shader reload debounce or cooldown is invalid\n";
         return 1;
     }
 
@@ -1482,6 +1514,13 @@ int selfTest() {
         std::ofstream(includeRoot / "local" / "nested.glsl") <<
             "#include \"/root.glsl\"\nfloat nestedValue = rootValue;\n";
         std::ofstream(includeRoot / "entry.glsl") << "#include \"local/nested.glsl\"\n";
+    }
+    const auto initialShaderFiles = shaderFileSnapshot(includeRoot);
+    std::ofstream(includeRoot / "local" / "included.glsl", std::ios::app) << "\n";
+    const auto updatedShaderFiles = shaderFileSnapshot(includeRoot);
+    if (initialShaderFiles == updatedShaderFiles) {
+        std::cerr << "self-test failed: shader directory changes were not observed\n";
+        return 1;
     }
     const std::string expanded = expandShaderIncludes(includeRoot / "entry.glsl", includeRoot);
     std::error_code includeError;
