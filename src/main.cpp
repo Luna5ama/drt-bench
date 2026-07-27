@@ -40,6 +40,28 @@ bool shaderReloadReady(bool pending, Clock::time_point lastAttempt,
     return pending && now - lastAttempt >= 1s && now - lastChange >= 1s;
 }
 
+const char* vkFormatName(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
+    case VK_FORMAT_B8G8R8A8_UNORM: return "VK_FORMAT_B8G8R8A8_UNORM";
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "VK_FORMAT_A2B10G10R10_UNORM_PACK32";
+    default: return "VK_FORMAT_UNKNOWN";
+    }
+}
+
+const char* vkColorSpaceName(VkColorSpaceKHR colorSpace) {
+    switch (colorSpace) {
+    case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR: return "VK_COLOR_SPACE_SRGB_NONLINEAR_KHR";
+    case VK_COLOR_SPACE_HDR10_ST2084_EXT: return "VK_COLOR_SPACE_HDR10_ST2084_EXT";
+    case VK_COLOR_SPACE_DOLBYVISION_EXT: return "VK_COLOR_SPACE_DOLBYVISION_EXT";
+    case VK_COLOR_SPACE_BT2020_LINEAR_EXT: return "VK_COLOR_SPACE_BT2020_LINEAR_EXT";
+    case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT: return "VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT";
+    case VK_COLOR_SPACE_HDR10_HLG_EXT: return "VK_COLOR_SPACE_HDR10_HLG_EXT";
+    case VK_COLOR_SPACE_DISPLAY_NATIVE_AMD: return "VK_COLOR_SPACE_DISPLAY_NATIVE_AMD";
+    default: return "VK_COLOR_SPACE_UNKNOWN";
+    }
+}
+
 LRESULT windowHitTest(const RECT& bounds, POINT point, LONG borderX, LONG borderY) {
     const bool left = point.x < bounds.left + borderX;
     const bool right = point.x >= bounds.right - borderX;
@@ -668,8 +690,9 @@ private:
             vkCheck(vkCreateImageView(device_, &viewInfo, nullptr, &swapchainViews_[i]), "vkCreateImageView");
         }
         SetWindowTextW(window_, hdr_ ? L"drt-bench [HDR]" : L"drt-bench [SDR]");
-        std::cout << (hdr_ ? "HDR" : "SDR") << " swapchain: format=" << swapchainFormat_
-                  << " colorspace=" << colorSpace_ << " extent=" << extent_.width << 'x' << extent_.height << '\n';
+        std::cout << (hdr_ ? "HDR" : "SDR") << " swapchain: format=" << vkFormatName(swapchainFormat_)
+                  << " colorspace=" << vkColorSpaceName(colorSpace_)
+                  << " extent=" << extent_.width << 'x' << extent_.height << '\n';
     }
 
     void destroySwapchain() {
@@ -1340,6 +1363,10 @@ private:
 
 int selfTest() {
     if (trim("  \"a b.exr\" \t") != "a b.exr") return 1;
+    if (std::string_view(vkFormatName(VK_FORMAT_A2B10G10R10_UNORM_PACK32)) !=
+            "VK_FORMAT_A2B10G10R10_UNORM_PACK32" ||
+        std::string_view(vkColorSpaceName(VK_COLOR_SPACE_HDR10_ST2084_EXT)) !=
+            "VK_COLOR_SPACE_HDR10_ST2084_EXT") return 1;
     const auto resize = parseWindowSize("640 360");
     if (!resize || resize->cx != 640 || resize->cy != 360 ||
         parseWindowSize("640 0") || parseWindowSize("640 360 extra")) return 1;
