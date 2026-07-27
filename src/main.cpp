@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -118,6 +119,16 @@ std::string trim(std::string value) {
         value = value.substr(1, value.size() - 2);
     }
     return value;
+}
+
+std::optional<SIZE> parseWindowSize(std::string_view text) {
+    std::istringstream stream{std::string(text)};
+    SIZE size{};
+    std::string extra;
+    if (!(stream >> size.cx >> size.cy) || stream >> extra || size.cx <= 0 || size.cy <= 0) {
+        return std::nullopt;
+    }
+    return size;
 }
 
 fs::path pathFromUtf8(const std::string& text) {
@@ -241,7 +252,7 @@ public:
         createWindow();
         initVulkan();
         startStdin();
-        std::cout << "commands: /loadexr /loadfp16 /loadfp32 /loaddrt /sdr /hdr /screenshot\n";
+        std::cout << "commands: /loadexr /loadfp16 /loadfp32 /loaddrt /sdr /hdr /screenshot /resize\n";
     }
 
     ~App() {
@@ -1167,12 +1178,23 @@ private:
                     if (!argument.empty()) throw std::runtime_error("usage: /screenshot");
                     screenshotPending_ = true;
                     dirty_ = true;
+                } else if (command == "/resize") {
+                    resizeWindow(argument);
                 } else if (!trim(line).empty()) {
                     std::cerr << "unknown command: " << command << '\n';
                 }
             } catch (const std::exception& error) {
                 std::cerr << "command failed: " << error.what() << '\n';
             }
+        }
+    }
+
+    void resizeWindow(const std::string& argument) {
+        const auto size = parseWindowSize(argument);
+        if (!size) throw std::runtime_error("usage: /resize <x> <y>");
+        if (!SetWindowPos(window_, nullptr, 0, 0, size->cx, size->cy,
+                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) {
+            throw std::runtime_error("SetWindowPos failed");
         }
     }
 
@@ -1318,6 +1340,9 @@ private:
 
 int selfTest() {
     if (trim("  \"a b.exr\" \t") != "a b.exr") return 1;
+    const auto resize = parseWindowSize("640 360");
+    if (!resize || resize->cx != 640 || resize->cy != 360 ||
+        parseWindowSize("640 0") || parseWindowSize("640 360 extra")) return 1;
     const RECT windowBounds{100, 100, 500, 400};
     const struct {
         POINT point;

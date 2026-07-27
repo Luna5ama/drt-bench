@@ -31,6 +31,7 @@ current DRT shader, and F6 toggles SDR/HDR.
 /sdr
 /hdr
 /screenshot
+/resize <x> <y>
 ```
 
 Paths may contain spaces; surrounding quotes are optional. Raw files are tightly packed, little-endian, row-major RGBA values and must contain exactly `window_width * window_height * 4` f16 or f32 components. EXR dimensions come from the file.
@@ -40,6 +41,8 @@ Paths may contain spaces; surrounding quotes are optional. Raw files are tightly
 Screenshots are saved in the current directory with timestamped names. SDR uses
 lossless WebP. HDR uses a 16-bit RGB PNG tagged as full-range Rec. 2020/PQ with a
 `cICP` chunk and requires the HDR10 ST2084 A2B10G10R10 swapchain format.
+
+`/resize` sets the borderless window to the requested pixel width and height.
 
 ## Shader contract
 
