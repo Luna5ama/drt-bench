@@ -2,6 +2,10 @@
 
 Minimal Windows Vulkan bench for iterating on compute-based DRT shaders. It opens a centered 1280x720 borderless window and only submits a frame after input, shader, display mode, exposure, or window state changes.
 
+## License
+
+The bench C++ and support files at the repository root are licensed under the MIT License; see [`LICENSE`](LICENSE). All files below [`shaders/ap`](shaders/ap) are GPL-3.0-only. [`shaders/ap/LICENSE`](shaders/ap/LICENSE) controls the Alpha-Piscium material in that directory.
+
 ## Build
 
 Requirements: Visual Studio C++ Build Tools, Vulkan SDK (including `glslc`), CMake, Ninja, and vcpkg.
