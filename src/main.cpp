@@ -153,6 +153,29 @@ std::optional<SIZE> parseWindowSize(std::string_view text) {
     return size;
 }
 
+std::string utf8FromWide(std::wstring_view text) {
+    if (text.empty()) return {};
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    std::string result(size, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                        result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+bool isCtrlC(const KEY_EVENT_RECORD& key) {
+    const DWORD controls = LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED;
+    return key.wVirtualKeyCode == 'C' && (key.dwControlKeyState & controls) != 0;
+}
+
+bool secondEmptyCtrlC(bool hasInput, unsigned& count) {
+    if (hasInput) {
+        count = 0;
+        return false;
+    }
+    return ++count == 2;
+}
+
 fs::path pathFromUtf8(const std::string& text) {
     return fs::path(reinterpret_cast<const char8_t*>(text.data()),
                     reinterpret_cast<const char8_t*>(text.data() + text.size()));
@@ -280,6 +303,7 @@ public:
     ~App() {
         commandState_->running = false;
         commandState_->window = nullptr;
+        if (consoleInput_ != INVALID_HANDLE_VALUE) SetConsoleMode(consoleInput_, consoleInputMode_);
         if (device_) vkDeviceWaitIdle(device_);
         destroyTexture(input_);
         if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
@@ -1158,18 +1182,68 @@ private:
     void startStdin() {
         commandState_->window = window_;
         const auto state = commandState_;
+        const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD inputMode = 0;
+        if (GetConsoleMode(input, &inputMode)) {
+            consoleInput_ = input;
+            consoleInputMode_ = inputMode;
+            SetConsoleMode(input, inputMode & ~(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
+            std::thread([state, input] { readConsoleInput(state, input); }).detach();
+            return;
+        }
         std::thread([state] {
             std::string line;
             while (state->running && std::getline(std::cin, line)) {
-                {
-                    std::lock_guard lock(state->mutex);
-                    state->lines.push_back(std::move(line));
-                }
-                if (const HWND window = state->window.load()) {
-                    PostMessageW(window, kCommandMessage, 0, 0);
-                }
+                queueCommand(state, std::move(line));
             }
         }).detach();
+    }
+
+    static void queueCommand(const std::shared_ptr<CommandState>& state, std::string line) {
+        {
+            std::lock_guard lock(state->mutex);
+            state->lines.push_back(std::move(line));
+        }
+        if (const HWND window = state->window.load()) PostMessageW(window, kCommandMessage, 0, 0);
+    }
+
+    static void readConsoleInput(const std::shared_ptr<CommandState>& state, HANDLE input) {
+        std::wstring line;
+        unsigned emptyCtrlCCount = 0;
+        INPUT_RECORD record{};
+        DWORD read = 0;
+        while (state->running && ReadConsoleInputW(input, &record, 1, &read)) {
+            if (!read || record.EventType != KEY_EVENT || !record.Event.KeyEvent.bKeyDown) continue;
+            const KEY_EVENT_RECORD& key = record.Event.KeyEvent;
+            if (isCtrlC(key)) {
+                const bool hasInput = !line.empty();
+                if (secondEmptyCtrlC(hasInput, emptyCtrlCCount)) {
+                    if (const HWND window = state->window.load()) PostMessageW(window, WM_CLOSE, 0, 0);
+                    return;
+                }
+                std::cout << "^C\r\n";
+                if (hasInput) line.clear();
+                else std::cout << "Press Ctrl+C again to exit.\r\n";
+                continue;
+            }
+
+            if (key.wVirtualKeyCode == VK_RETURN) {
+                emptyCtrlCCount = 0;
+                std::cout << "\r\n";
+                queueCommand(state, utf8FromWide(line));
+                line.clear();
+            } else if (key.wVirtualKeyCode == VK_BACK) {
+                emptyCtrlCCount = 0;
+                if (!line.empty()) {
+                    line.pop_back();
+                    std::cout << "\b \b";
+                }
+            } else if (key.uChar.UnicodeChar >= L' ') {
+                emptyCtrlCCount = 0;
+                line += key.uChar.UnicodeChar;
+                std::cout << utf8FromWide(std::wstring_view(&key.uChar.UnicodeChar, 1));
+            }
+        }
     }
 
     void processCommands() {
@@ -1319,6 +1393,8 @@ private:
     bool hdrToggleRequested_ = false;
     bool screenshotPending_ = false;
     std::shared_ptr<CommandState> commandState_ = std::make_shared<CommandState>();
+    HANDLE consoleInput_ = INVALID_HANDLE_VALUE;
+    DWORD consoleInputMode_ = 0;
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
@@ -1367,6 +1443,9 @@ int selfTest() {
             "VK_FORMAT_A2B10G10R10_UNORM_PACK32" ||
         std::string_view(vkColorSpaceName(VK_COLOR_SPACE_HDR10_ST2084_EXT)) !=
             "VK_COLOR_SPACE_HDR10_ST2084_EXT") return 1;
+    unsigned ctrlCCount = 0;
+    if (secondEmptyCtrlC(true, ctrlCCount) || secondEmptyCtrlC(false, ctrlCCount) ||
+        !secondEmptyCtrlC(false, ctrlCCount)) return 1;
     const auto resize = parseWindowSize("640 360");
     if (!resize || resize->cx != 640 || resize->cy != 360 ||
         parseWindowSize("640 0") || parseWindowSize("640 360 extra")) return 1;
