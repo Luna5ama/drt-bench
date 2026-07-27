@@ -63,10 +63,10 @@ The shader supplies `main()`. `usam_inputTex` uses linear filtering with clamp-t
 
 ## Alpha-Piscium DRT
 
-`shaders\alpha-piscium-drt.glsl` accepts linear ACES AP0 input only. Set `DRT_BENCH_DRT` to `0` for AgX, `1` for OpenDRT, or `2` for Skibidi.
+`shaders\alpha-piscium\main.glsl` accepts linear ACES AP0 input only. Set `DRT_BENCH_DRT` to `0` for AgX, `1` for OpenDRT, or `2` for Skibidi.
 
 ```text
-/loaddrt shaders
+/loaddrt shaders\alpha-piscium
 /loadexr <path>
 ```
 

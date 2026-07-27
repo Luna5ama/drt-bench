@@ -546,9 +546,9 @@ private:
         const float gray[] = {0.18f, 0.18f, 0.18f, 1.0f};
         uploadTexture(gray, sizeof(gray), 1, 1, VK_FORMAT_R32G32B32A32_SFLOAT);
 
-        const fs::path defaultShader = executableDir_ / "passthrough.glsl";
+        const fs::path defaultShader = executableDir_ / "passthrough" / "main.glsl";
         if (!loadShader(defaultShader, true)) {
-            throw std::runtime_error("failed to compile bundled passthrough.glsl");
+            throw std::runtime_error("failed to compile bundled passthrough/main.glsl");
         }
     }
 

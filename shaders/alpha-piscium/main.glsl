@@ -55,11 +55,11 @@
 #define SETTING_SKIBIDI_YELLOW_GAMUT_COMPRESS 3.5
 
 #if DRT_BENCH_DRT == 0
-#include "techniques/drt/AgX.glsl"
+#include "../techniques/drt/AgX.glsl"
 #elif DRT_BENCH_DRT == 1
-#include "techniques/drt/OpenDRT.glsl"
+#include "../techniques/drt/OpenDRT.glsl"
 #elif DRT_BENCH_DRT == 2
-#include "techniques/drt/Skibidi.glsl"
+#include "../techniques/drt/Skibidi.glsl"
 #else
 #error DRT_BENCH_DRT must be 0 (AgX), 1 (OpenDRT), or 2 (Skibidi)
 #endif
