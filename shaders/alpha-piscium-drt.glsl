@@ -1,5 +1,5 @@
 // 0 = AgX, 1 = OpenDRT, 2 = Skibidi
-#define DRT_BENCH_DRT 0
+#define DRT_BENCH_DRT 1
 
 // Alpha-Piscium defaults. These are compatibility settings, not DRT core edits.
 #define SETTING_DRT_WORKING_COLOR_SPACE 1

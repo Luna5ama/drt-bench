@@ -68,3 +68,12 @@ After `/loaddrt`, the source file is polled for changes. Successful recompiles r
 ```
 
 The copied AgX, OpenDRT, and Skibidi core files are intentionally byte-for-byte unchanged; compatibility code lives outside them. For HDR, output bridges the cores' sRGB through linear Rec. 2020 to ST 2084, using 203 nits as SDR white.
+
+## OpenDRT converter
+
+`opendrt-convert.exe` accepts any number of EXR files, quoted wildcard patterns, and directories. Directories are scanned non-recursively for EXR files. Each input is converted with the standard OpenDRT look to a lossless WebP beside the source, replacing `.exr` with `.webp`.
+
+```powershell
+.\build\opendrt-convert.exe frame.exr "frames\*.exr" frames
+.\build\opendrt-convert.exe --self-test
+```
