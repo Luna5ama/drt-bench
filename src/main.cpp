@@ -39,6 +39,18 @@ bool shaderReloadReady(bool pending, Clock::time_point lastAttempt,
     return pending && now - lastAttempt >= 1s && now - lastChange >= 1s;
 }
 
+LRESULT windowHitTest(const RECT& bounds, POINT point, LONG borderX, LONG borderY) {
+    const bool left = point.x < bounds.left + borderX;
+    const bool right = point.x >= bounds.right - borderX;
+    const bool top = point.y < bounds.top + borderY;
+    const bool bottom = point.y >= bounds.bottom - borderY;
+    if (top) return left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP;
+    if (bottom) return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
+    if (left) return HTLEFT;
+    if (right) return HTRIGHT;
+    return HTCAPTION;
+}
+
 void vkCheck(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) {
         throw std::runtime_error(std::string(operation) + " failed with VkResult " + std::to_string(result));
@@ -287,6 +299,8 @@ private:
         auto* app = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
         if (!app) return DefWindowProcW(window, message, wparam, lparam);
         switch (message) {
+        case WM_NCCALCSIZE:
+            return wparam ? 0 : DefWindowProcW(window, message, wparam, lparam);
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT: {
@@ -300,6 +314,17 @@ private:
             app->minimized_ = wparam == SIZE_MINIMIZED;
             app->resizePending_ = !app->minimized_;
             return 0;
+        case WM_NCHITTEST: {
+            RECT bounds{};
+            GetWindowRect(window, &bounds);
+            const UINT dpi = GetDpiForWindow(window);
+            const LONG borderX = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
+                                 GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+            const LONG borderY = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
+                                 GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+            const POINTS cursor = MAKEPOINTS(lparam);
+            return windowHitTest(bounds, {cursor.x, cursor.y}, borderX, borderY);
+        }
         case WM_KEYDOWN:
             if (lparam & (1LL << 30)) return 0;
             if (wparam == VK_ESCAPE) {
@@ -345,10 +370,13 @@ private:
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
         const int x = work.left + (work.right - work.left - width) / 2;
         const int y = work.top + (work.bottom - work.top - height) / 2;
-        window_ = CreateWindowExW(0, windowClass.lpszClassName, L"drt-bench [SDR]", WS_POPUP,
+        window_ = CreateWindowExW(0, windowClass.lpszClassName, L"drt-bench [SDR]",
+                                  WS_THICKFRAME | WS_CAPTION,
                                   x, y, width, height, nullptr, nullptr, module, nullptr);
         if (!window_) throw std::runtime_error("CreateWindowExW failed");
         SetWindowLongPtrW(window_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+        SetWindowPos(window_, nullptr, 0, 0, 0, 0,
+                     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         ShowWindow(window_, SW_SHOW);
     }
 
@@ -1290,6 +1318,20 @@ private:
 
 int selfTest() {
     if (trim("  \"a b.exr\" \t") != "a b.exr") return 1;
+    const RECT windowBounds{100, 100, 500, 400};
+    const struct {
+        POINT point;
+        LRESULT expected;
+    } hitTests[] = {
+        {{100, 100}, HTTOPLEFT}, {{499, 100}, HTTOPRIGHT},
+        {{100, 399}, HTBOTTOMLEFT}, {{499, 399}, HTBOTTOMRIGHT},
+        {{300, 100}, HTTOP}, {{300, 399}, HTBOTTOM},
+        {{100, 250}, HTLEFT}, {{499, 250}, HTRIGHT},
+        {{300, 250}, HTCAPTION},
+    };
+    for (const auto& test : hitTests) {
+        if (windowHitTest(windowBounds, test.point, 8, 8) != test.expected) return 1;
+    }
     constexpr uint32_t width = 1280;
     constexpr uint32_t height = 720;
     const size_t fp16Bytes = static_cast<size_t>(width) * height * 4 * 2;
