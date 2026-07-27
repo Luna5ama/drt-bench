@@ -3,7 +3,9 @@ cmake_minimum_required(VERSION 3.25)
 project(drt-bench LANGUAGES CXX)
 
 find_package(Vulkan REQUIRED)
+find_package(PNG REQUIRED)
 find_package(tinyexr CONFIG REQUIRED)
+find_package(WebP CONFIG REQUIRED)
 
 add_executable(drt-bench src/main.cpp)
 target_compile_features(drt-bench PRIVATE cxx_std_20)
@@ -13,7 +15,7 @@ target_compile_definitions(drt-bench PRIVATE
   NOMINMAX
   UNICODE
   _UNICODE)
-target_link_libraries(drt-bench PRIVATE Vulkan::Vulkan unofficial::tinyexr::tinyexr)
+target_link_libraries(drt-bench PRIVATE Vulkan::Vulkan PNG::PNG WebP::webp unofficial::tinyexr::tinyexr)
 
 if(MSVC)
   target_compile_options(drt-bench PRIVATE /W4 /permissive- /EHsc)

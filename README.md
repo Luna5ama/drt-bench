@@ -18,7 +18,8 @@ Run from a terminal so stdin remains available:
 .\build\drt-bench.exe
 ```
 
-Press Escape or close the window to exit.
+Press Escape or close the window to exit. F2 saves a screenshot, F5 reloads the
+current DRT shader, and F6 toggles SDR/HDR.
 
 ## Commands
 
@@ -29,11 +30,16 @@ Press Escape or close the window to exit.
 /loaddrt <path>
 /sdr
 /hdr
+/screenshot
 ```
 
 Paths may contain spaces; surrounding quotes are optional. Raw files are tightly packed, little-endian, row-major RGBA values and must contain exactly `window_width * window_height * 4` f16 or f32 components. EXR dimensions come from the file.
 
 `/hdr` prefers `VK_COLOR_SPACE_HDR10_ST2084_EXT` with `VK_FORMAT_A2B10G10R10_UNORM_PACK32`, then falls back through the best HDR surface formats reported by the active display. `/sdr` prefers an 8-bit UNORM swapchain with `VK_COLOR_SPACE_SRGB_NONLINEAR_KHR`. The selected pair is printed to stdout.
+
+Screenshots are saved in the current directory with timestamped names. SDR uses
+lossless WebP. HDR uses a 16-bit RGB PNG tagged as full-range Rec. 2020/PQ with a
+`cICP` chunk and requires the HDR10 ST2084 A2B10G10R10 swapchain format.
 
 ## Shader contract
 

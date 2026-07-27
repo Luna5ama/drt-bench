@@ -3,6 +3,8 @@
   "version-string": "0.1.0",
   "builtin-baseline": "d034cf165b78579b6d526cf440d2781940e9074b",
   "dependencies": [
+    "libpng",
+    "libwebp",
     "tinyexr"
   ]
 }

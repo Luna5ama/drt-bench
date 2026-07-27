@@ -1,11 +1,14 @@
 #include <windows.h>
+#include <png.h>
 #include <vulkan/vulkan.h>
+#include <webp/encode.h>
 #include <tinyexr.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -110,6 +113,97 @@ fs::path pathFromUtf8(const std::string& text) {
                     reinterpret_cast<const char8_t*>(text.data() + text.size()));
 }
 
+fs::path screenshotPath(bool hdr) {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    wchar_t name[96]{};
+    swprintf_s(name, L"screenshot-%04u%02u%02u-%02u%02u%02u-%03u.%s",
+               time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute,
+               time.wSecond, time.wMilliseconds, hdr ? L"png" : L"webp");
+    fs::path path = fs::current_path() / name;
+    for (unsigned suffix = 1; fs::exists(path); ++suffix) {
+        swprintf_s(name, L"screenshot-%04u%02u%02u-%02u%02u%02u-%03u-%u.%s",
+                   time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute,
+                   time.wSecond, time.wMilliseconds, suffix, hdr ? L"png" : L"webp");
+        path = fs::current_path() / name;
+    }
+    return path;
+}
+
+void saveLosslessWebp(const fs::path& path, const uint8_t* pixels,
+                      uint32_t width, uint32_t height, bool bgra) {
+    uint8_t* encoded = nullptr;
+    const int encodedWidth = static_cast<int>(width);
+    const int encodedHeight = static_cast<int>(height);
+    const int stride = static_cast<int>(width * 4);
+    const size_t size = bgra
+        ? WebPEncodeLosslessBGRA(pixels, encodedWidth, encodedHeight, stride, &encoded)
+        : WebPEncodeLosslessRGBA(pixels, encodedWidth, encodedHeight, stride, &encoded);
+    if (!size) throw std::runtime_error("WebP lossless encoding failed");
+    std::ofstream file(path, std::ios::binary);
+    if (!file.write(reinterpret_cast<const char*>(encoded), static_cast<std::streamsize>(size))) {
+        WebPFree(encoded);
+        throw std::runtime_error("cannot write " + path.string());
+    }
+    WebPFree(encoded);
+}
+
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4611)
+#endif
+void saveHdrPng(const fs::path& path, const uint32_t* pixels,
+                uint32_t width, uint32_t height) {
+    constexpr png_byte kBt2020Primaries = 9;
+    constexpr png_byte kPqTransfer = 16;
+    constexpr png_byte kRgbIdentityMatrix = 0;
+    constexpr png_byte kFullRange = 1;
+    std::vector<png_byte> rgb(static_cast<size_t>(width) * height * 6);
+    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
+        const uint32_t packed = pixels[i];
+        const uint16_t channels[] = {
+            static_cast<uint16_t>(((packed >> 0) & 1023) * 65535 / 1023),
+            static_cast<uint16_t>(((packed >> 10) & 1023) * 65535 / 1023),
+            static_cast<uint16_t>(((packed >> 20) & 1023) * 65535 / 1023),
+        };
+        for (size_t channel = 0; channel < 3; ++channel) {
+            rgb[i * 6 + channel * 2] = static_cast<png_byte>(channels[channel] >> 8);
+            rgb[i * 6 + channel * 2 + 1] = static_cast<png_byte>(channels[channel]);
+        }
+    }
+    std::vector<png_bytep> rows(height);
+    for (uint32_t y = 0; y < height; ++y) rows[y] = rgb.data() + static_cast<size_t>(y) * width * 6;
+
+    FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(), L"wb") || !file) {
+        throw std::runtime_error("cannot create " + path.string());
+    }
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    png_infop info = png ? png_create_info_struct(png) : nullptr;
+    if (!png || !info) {
+        if (png) png_destroy_write_struct(&png, nullptr);
+        fclose(file);
+        throw std::runtime_error("PNG encoder initialization failed");
+    }
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        fclose(file);
+        throw std::runtime_error("HDR PNG encoding failed");
+    }
+    png_init_io(png, file);
+    png_set_IHDR(png, info, width, height, 16, PNG_COLOR_TYPE_RGB,
+                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_set_cICP(png, info, kBt2020Primaries, kPqTransfer, kRgbIdentityMatrix, kFullRange);
+    png_write_info(png, info);
+    png_write_image(png, rows.data());
+    png_write_end(png, info);
+    png_destroy_write_struct(&png, &info);
+    fclose(file);
+}
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
 std::wstring quote(const fs::path& path) {
     return L"\"" + path.wstring() + L"\"";
 }
@@ -135,7 +229,7 @@ public:
         createWindow();
         initVulkan();
         startStdin();
-        std::cout << "commands: /loadexr /loadfp16 /loadfp32 /loaddrt /sdr /hdr\n";
+        std::cout << "commands: /loadexr /loadfp16 /loadfp32 /loaddrt /sdr /hdr /screenshot\n";
     }
 
     ~App() {
@@ -174,6 +268,7 @@ public:
             if (!running_) break;
 
             processCommands();
+            processHotkeys();
             pollShader();
             if (resizePending_ && !minimized_) {
                 resizePending_ = false;
@@ -206,7 +301,17 @@ private:
             app->resizePending_ = !app->minimized_;
             return 0;
         case WM_KEYDOWN:
-            if (wparam == VK_ESCAPE) DestroyWindow(window);
+            if (lparam & (1LL << 30)) return 0;
+            if (wparam == VK_ESCAPE) {
+                DestroyWindow(window);
+            } else if (wparam == VK_F2) {
+                app->screenshotPending_ = true;
+                app->dirty_ = true;
+            } else if (wparam == VK_F5) {
+                app->reloadRequested_ = true;
+            } else if (wparam == VK_F6) {
+                app->hdrToggleRequested_ = true;
+            }
             return 0;
         case WM_CLOSE:
             DestroyWindow(window);
@@ -443,8 +548,9 @@ private:
         VkSurfaceCapabilitiesKHR capabilities{};
         vkCheck(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface_, &capabilities),
                 "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
-        if (!(capabilities.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT)) {
-            throw std::runtime_error("surface swapchain images do not support storage usage");
+        const VkImageUsageFlags requiredUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if ((capabilities.supportedUsageFlags & requiredUsage) != requiredUsage) {
+            throw std::runtime_error("surface swapchain images do not support storage and screenshot usage");
         }
         uint32_t formatCount = 0;
         vkCheck(vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice_, surface_, &formatCount, nullptr),
@@ -490,7 +596,7 @@ private:
         info.imageColorSpace = selected.colorSpace;
         info.imageExtent = extent;
         info.imageArrayLayers = 1;
-        info.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT;
+        info.imageUsage = requiredUsage;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         info.preTransform = capabilities.currentTransform;
         info.compositeAlpha = alpha;
@@ -544,6 +650,32 @@ private:
         throw std::runtime_error("no compatible Vulkan memory type");
     }
 
+    void createHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                          VkBuffer& buffer, VkDeviceMemory& memory) {
+        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufferInfo.size = size;
+        bufferInfo.usage = usage;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vkCheck(vkCreateBuffer(device_, &bufferInfo, nullptr, &buffer), "vkCreateBuffer");
+        try {
+            VkMemoryRequirements requirements{};
+            vkGetBufferMemoryRequirements(device_, buffer, &requirements);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex =
+                memoryType(requirements.memoryTypeBits,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkCheck(vkAllocateMemory(device_, &allocation, nullptr, &memory), "vkAllocateMemory");
+            vkCheck(vkBindBufferMemory(device_, buffer, memory, 0), "vkBindBufferMemory");
+        } catch (...) {
+            if (memory) vkFreeMemory(device_, memory, nullptr);
+            vkDestroyBuffer(device_, buffer, nullptr);
+            buffer = VK_NULL_HANDLE;
+            memory = VK_NULL_HANDLE;
+            throw;
+        }
+    }
+
     void uploadTexture(const void* pixels, size_t byteCount, uint32_t width, uint32_t height, VkFormat format) {
         VkFormatProperties formatProperties{};
         vkGetPhysicalDeviceFormatProperties(physicalDevice_, format, &formatProperties);
@@ -556,20 +688,7 @@ private:
 
         VkBuffer staging = VK_NULL_HANDLE;
         VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-        VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufferInfo.size = byteCount;
-        bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        vkCheck(vkCreateBuffer(device_, &bufferInfo, nullptr, &staging), "vkCreateBuffer");
-        VkMemoryRequirements bufferRequirements{};
-        vkGetBufferMemoryRequirements(device_, staging, &bufferRequirements);
-        VkMemoryAllocateInfo bufferAllocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        bufferAllocation.allocationSize = bufferRequirements.size;
-        bufferAllocation.memoryTypeIndex =
-            memoryType(bufferRequirements.memoryTypeBits,
-                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkCheck(vkAllocateMemory(device_, &bufferAllocation, nullptr, &stagingMemory), "vkAllocateMemory");
-        vkCheck(vkBindBufferMemory(device_, staging, stagingMemory, 0), "vkBindBufferMemory");
+        createHostBuffer(byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging, stagingMemory);
         void* mapped = nullptr;
         vkCheck(vkMapMemory(device_, stagingMemory, 0, byteCount, 0, &mapped), "vkMapMemory");
         std::memcpy(mapped, pixels, byteCount);
@@ -792,6 +911,24 @@ private:
         }
     }
 
+    void saveScreenshot(const void* pixels) {
+        const fs::path path = screenshotPath(hdr_);
+        if (hdr_) {
+            if (swapchainFormat_ != VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                colorSpace_ != VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                throw std::runtime_error("HDR PNG requires an HDR10 ST2084 A2B10G10R10 swapchain");
+            }
+            saveHdrPng(path, static_cast<const uint32_t*>(pixels), extent_.width, extent_.height);
+        } else {
+            const bool bgra = swapchainFormat_ == VK_FORMAT_B8G8R8A8_UNORM;
+            if (!bgra && swapchainFormat_ != VK_FORMAT_R8G8B8A8_UNORM) {
+                throw std::runtime_error("lossless WebP requires an RGBA8 or BGRA8 swapchain");
+            }
+            saveLosslessWebp(path, static_cast<const uint8_t*>(pixels), extent_.width, extent_.height, bgra);
+        }
+        std::cout << "screenshot saved: " << path.string() << '\n';
+    }
+
     void draw() {
         vkCheck(vkWaitForFences(device_, 1, &renderFence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
         uint32_t imageIndex = 0;
@@ -807,6 +944,25 @@ private:
         }
         vkCheck(vkResetFences(device_, 1, &renderFence_), "vkResetFences");
         vkCheck(vkResetCommandBuffer(commandBuffer_, 0), "vkResetCommandBuffer");
+
+        bool capture = screenshotPending_;
+        if (capture && hdr_ &&
+            (swapchainFormat_ != VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+             colorSpace_ != VK_COLOR_SPACE_HDR10_ST2084_EXT)) {
+            std::cerr << "screenshot failed: HDR PNG requires an HDR10 ST2084 A2B10G10R10 swapchain\n";
+            capture = false;
+            screenshotPending_ = false;
+        }
+        if (capture && !hdr_ && swapchainFormat_ != VK_FORMAT_R8G8B8A8_UNORM &&
+            swapchainFormat_ != VK_FORMAT_B8G8R8A8_UNORM) {
+            std::cerr << "screenshot failed: lossless WebP requires an RGBA8 or BGRA8 swapchain\n";
+            capture = false;
+            screenshotPending_ = false;
+        }
+        VkBuffer readback = VK_NULL_HANDLE;
+        VkDeviceMemory readbackMemory = VK_NULL_HANDLE;
+        const VkDeviceSize readbackSize = static_cast<VkDeviceSize>(extent_.width) * extent_.height * 4;
+        if (capture) createHostBuffer(readbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback, readbackMemory);
 
         VkDescriptorImageInfo inputInfo{};
         inputInfo.sampler = sampler_;
@@ -851,17 +1007,47 @@ private:
         vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
         vkCmdDispatch(commandBuffer_, (extent_.width + 7) / 8, (extent_.height + 7) / 8, 1);
-        VkImageMemoryBarrier toPresent{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        toPresent.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        toPresent.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        toPresent.image = swapchainImages_[imageIndex];
-        toPresent.subresourceRange = toGeneral.subresourceRange;
+        VkImageMemoryBarrier afterCompute{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        afterCompute.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        afterCompute.dstAccessMask = capture ? VK_ACCESS_TRANSFER_READ_BIT : 0;
+        afterCompute.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        afterCompute.newLayout = capture ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        afterCompute.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        afterCompute.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        afterCompute.image = swapchainImages_[imageIndex];
+        afterCompute.subresourceRange = toGeneral.subresourceRange;
         vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
-                             0, nullptr, 0, nullptr, 1, &toPresent);
+                             capture ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &afterCompute);
+        if (capture) {
+            VkBufferImageCopy copy{};
+            copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copy.imageSubresource.layerCount = 1;
+            copy.imageExtent = {extent_.width, extent_.height, 1};
+            vkCmdCopyImageToBuffer(commandBuffer_, swapchainImages_[imageIndex],
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+            VkBufferMemoryBarrier toHost{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            toHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toHost.buffer = readback;
+            toHost.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_HOST_BIT, 0,
+                                 0, nullptr, 1, &toHost, 0, nullptr);
+            VkImageMemoryBarrier toPresent{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            toPresent.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toPresent.image = swapchainImages_[imageIndex];
+            toPresent.subresourceRange = toGeneral.subresourceRange;
+            vkCmdPipelineBarrier(commandBuffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                                 0, nullptr, 0, nullptr, 1, &toPresent);
+        }
         vkCheck(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer");
 
         const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -883,6 +1069,21 @@ private:
         present.pSwapchains = &swapchain_;
         present.pImageIndices = &imageIndex;
         const VkResult presented = vkQueuePresentKHR(queue_, &present);
+        if (capture) {
+            screenshotPending_ = false;
+            vkCheck(vkWaitForFences(device_, 1, &renderFence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+            void* mapped = nullptr;
+            try {
+                vkCheck(vkMapMemory(device_, readbackMemory, 0, readbackSize, 0, &mapped), "vkMapMemory");
+                saveScreenshot(mapped);
+                vkUnmapMemory(device_, readbackMemory);
+            } catch (const std::exception& error) {
+                if (mapped) vkUnmapMemory(device_, readbackMemory);
+                std::cerr << "screenshot failed: " << error.what() << '\n';
+            }
+            vkDestroyBuffer(device_, readback, nullptr);
+            vkFreeMemory(device_, readbackMemory, nullptr);
+        }
         if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) {
             recreateSwapchain();
             dirty_ = true;
@@ -934,12 +1135,35 @@ private:
                     setHdr(false);
                 } else if (command == "/hdr") {
                     setHdr(true);
+                } else if (command == "/screenshot") {
+                    if (!argument.empty()) throw std::runtime_error("usage: /screenshot");
+                    screenshotPending_ = true;
+                    dirty_ = true;
                 } else if (!trim(line).empty()) {
                     std::cerr << "unknown command: " << command << '\n';
                 }
             } catch (const std::exception& error) {
                 std::cerr << "command failed: " << error.what() << '\n';
             }
+        }
+    }
+
+    void processHotkeys() {
+        try {
+            if (reloadRequested_) {
+                reloadRequested_ = false;
+                if (shaderPath_.empty()) {
+                    std::cerr << "F5 ignored: no DRT shader loaded\n";
+                } else {
+                    loadShader(shaderPath_, false);
+                }
+            }
+            if (hdrToggleRequested_) {
+                hdrToggleRequested_ = false;
+                setHdr(!hdr_);
+            }
+        } catch (const std::exception& error) {
+            std::cerr << "hotkey failed: " << error.what() << '\n';
         }
     }
 
@@ -1018,6 +1242,9 @@ private:
     bool resizePending_ = false;
     bool dirty_ = true;
     bool hdr_ = false;
+    bool reloadRequested_ = false;
+    bool hdrToggleRequested_ = false;
+    bool screenshotPending_ = false;
     std::shared_ptr<CommandState> commandState_ = std::make_shared<CommandState>();
 
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -1118,6 +1345,29 @@ int selfTest() {
         return 1;
     }
     free(decoded);
+
+    const fs::path webpPath = fs::temp_directory_path() / "drt-bench-self-test.webp";
+    const fs::path pngPath = fs::temp_directory_path() / "drt-bench-self-test.png";
+    const uint32_t white = 0xffffffffu;
+    saveLosslessWebp(webpPath, reinterpret_cast<const uint8_t*>(&white), 1, 1, false);
+    saveHdrPng(pngPath, &white, 1, 1);
+    const auto webp = readFile(webpPath);
+    const auto png = readFile(pngPath);
+    fs::remove(webpPath, ignored);
+    fs::remove(pngPath, ignored);
+    const std::byte webpSignature[] = {
+        std::byte{'R'}, std::byte{'I'}, std::byte{'F'}, std::byte{'F'}
+    };
+    const std::byte cicpChunk[] = {
+        std::byte{'c'}, std::byte{'I'}, std::byte{'C'}, std::byte{'P'},
+        std::byte{9}, std::byte{16}, std::byte{0}, std::byte{1}
+    };
+    if (webp.size() < std::size(webpSignature) ||
+        !std::equal(std::begin(webpSignature), std::end(webpSignature), webp.begin()) ||
+        std::search(png.begin(), png.end(), std::begin(cicpChunk), std::end(cicpChunk)) == png.end()) {
+        std::cerr << "self-test failed: screenshot encoding or HDR metadata is invalid\n";
+        return 1;
+    }
     std::cout << "self-test passed\n";
     return 0;
 }
