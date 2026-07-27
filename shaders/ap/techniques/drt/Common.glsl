@@ -3,7 +3,7 @@
 
 #include "../../util/Colors2.glsl"
 
-#define USE_LOOK 1
+#define USE_LOOK 0
 
 vec3 drt_look(vec3 color, vec3 offset, vec3 slope, vec3 power, float saturation) {
     #if USE_LOOK
