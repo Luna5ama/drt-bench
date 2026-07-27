@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -175,6 +176,45 @@ std::optional<SIZE> parseWindowSize(std::string_view text) {
     return size;
 }
 
+struct StartupOptions {
+    std::optional<std::string> drt;
+    std::optional<std::string> exr;
+    std::optional<std::string> fp16;
+    std::optional<std::string> fp32;
+    int width = 1280;
+    int height = 720;
+};
+
+int parseDimension(std::string_view text, std::string_view option) {
+    int value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value <= 0) {
+        throw std::runtime_error("usage: " + std::string(option) + " <positive integer>");
+    }
+    return value;
+}
+
+StartupOptions parseStartupOptions(const std::vector<std::string_view>& arguments) {
+    StartupOptions options;
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        const std::string_view option = arguments[i];
+        if (option != "--drt" && option != "-d" && option != "--exr" && option != "-e" &&
+            option != "--fp16" && option != "--fp32" && option != "--width" && option != "-w" &&
+            option != "--height" && option != "-h") {
+            throw std::runtime_error("unknown option: " + std::string(option));
+        }
+        if (++i == arguments.size()) throw std::runtime_error("missing value for " + std::string(option));
+        const std::string_view value = arguments[i];
+        if (option == "--drt" || option == "-d") options.drt = std::string(value);
+        else if (option == "--exr" || option == "-e") options.exr = std::string(value);
+        else if (option == "--fp16") options.fp16 = std::string(value);
+        else if (option == "--fp32") options.fp32 = std::string(value);
+        else if (option == "--width" || option == "-w") options.width = parseDimension(value, option);
+        else options.height = parseDimension(value, option);
+    }
+    return options;
+}
+
 std::string utf8FromWide(std::wstring_view text) {
     if (text.empty()) return {};
     const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
@@ -315,9 +355,14 @@ struct Texture {
 
 class App {
 public:
-    explicit App(const fs::path& executable) : executableDir_(executable.parent_path()) {
+    App(const fs::path& executable, const StartupOptions& options)
+        : executableDir_(executable.parent_path()), initialWidth_(options.width), initialHeight_(options.height) {
         createWindow();
         initVulkan();
+        if (options.drt) loadShaderDirectory(pathFromUtf8(*options.drt));
+        if (options.exr) loadExr(*options.exr);
+        if (options.fp16) loadRaw(*options.fp16, 2, VK_FORMAT_R16G16B16A16_SFLOAT);
+        if (options.fp32) loadRaw(*options.fp32, 4, VK_FORMAT_R32G32B32A32_SFLOAT);
         startStdin();
         std::cout << "commands: /loadexr /loadfp16 /loadfp32 /loaddrt /sdr /hdr /screenshot /resize\n";
     }
@@ -443,15 +488,13 @@ private:
             throw std::runtime_error("RegisterClassW failed");
         }
 
-        constexpr int width = 1280;
-        constexpr int height = 720;
         RECT work{};
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-        const int x = work.left + (work.right - work.left - width) / 2;
-        const int y = work.top + (work.bottom - work.top - height) / 2;
+        const int x = work.left + (work.right - work.left - initialWidth_) / 2;
+        const int y = work.top + (work.bottom - work.top - initialHeight_) / 2;
         window_ = CreateWindowExW(0, windowClass.lpszClassName, L"drt-bench [SDR]",
                                   WS_THICKFRAME | WS_CAPTION,
-                                  x, y, width, height, nullptr, nullptr, module, nullptr);
+                                  x, y, initialWidth_, initialHeight_, nullptr, nullptr, module, nullptr);
         if (!window_) throw std::runtime_error("CreateWindowExW failed");
         SetWindowLongPtrW(window_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
         SetWindowPos(window_, nullptr, 0, 0, 0, 0,
@@ -1453,6 +1496,8 @@ private:
     std::vector<bool> imageInitialized_;
 
     fs::path executableDir_;
+    int initialWidth_ = 1280;
+    int initialHeight_ = 720;
     fs::path shaderPath_;
     fs::path shaderDirectory_;
     ShaderFileSnapshot observedShaderFiles_;
@@ -1469,6 +1514,15 @@ private:
 
 int selfTest() {
     if (trim("  \"a b.exr\" \t") != "a b.exr") return 1;
+    const auto startup = parseStartupOptions({"-d", "shaders/ap", "-e", "input.exr", "--fp16", "a.raw",
+                                              "--fp32", "b.raw", "-w", "640", "-h", "360"});
+    if (startup.drt != "shaders/ap" || startup.exr != "input.exr" || startup.fp16 != "a.raw" ||
+        startup.fp32 != "b.raw" || startup.width != 640 || startup.height != 360) return 1;
+    try {
+        parseStartupOptions({"--width", "0"});
+        return 1;
+    } catch (const std::runtime_error&) {
+    }
     if (std::string_view(vkFormatName(VK_FORMAT_A2B10G10R10_UNORM_PACK32)) !=
             "VK_FORMAT_A2B10G10R10_UNORM_PACK32" ||
         std::string_view(vkColorSpaceName(VK_COLOR_SPACE_HDR10_ST2084_EXT)) !=
@@ -1592,7 +1646,10 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--self-test") return selfTest();
     try {
         const fs::path executable = fs::absolute(pathFromUtf8(argv[0]));
-        App app(executable);
+        std::vector<std::string_view> arguments;
+        arguments.reserve(argc - 1);
+        for (int i = 1; i < argc; ++i) arguments.emplace_back(argv[i]);
+        App app(executable, parseStartupOptions(arguments));
         return app.run();
     } catch (const std::exception& error) {
         std::cerr << "fatal: " << error.what() << '\n';

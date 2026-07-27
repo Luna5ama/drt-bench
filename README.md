@@ -21,6 +21,24 @@ Run from a terminal so stdin remains available:
 Press Escape or close the window to exit. F2 saves a screenshot, F5 reloads the
 current DRT shader, and F6 toggles SDR/HDR.
 
+## Startup options
+
+```text
+--drt <path> | -d <path>
+--exr <path> | -e <path>
+--fp16 <path>
+--fp32 <path>
+--width <x> | -w <x>
+--height <y> | -h <y>
+```
+
+These perform the matching load commands at startup. `--width` and `--height`
+set the initial window and swapchain size before raw input is checked or loaded.
+
+```powershell
+.\build\drt-bench.exe -d shaders\ap -e frame.exr -w 1920 -h 1080
+```
+
 ## Commands
 
 ```text
