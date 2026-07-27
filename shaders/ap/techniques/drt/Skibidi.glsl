@@ -2,9 +2,9 @@
 #define INCLUDE_techniques_drt_Skibidi_glsl a
 
 #include "Common.glsl"
-#include "/util/colors/Jzazbz.glsl"
-#include "/util/colors/OKLab.glsl"
-#include "/util/colors/ICtCp.glsl"
+#include "../../util/colors/Jzazbz.glsl"
+#include "../../util/colors/OKLab.glsl"
+#include "../../util/colors/ICtCp.glsl"
 
 // -------------------------------------------- Absolute Luminance Anchor --------------------------------------------
 

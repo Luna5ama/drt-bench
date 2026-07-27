@@ -10,7 +10,7 @@
 #ifndef INCLUDE_util_colors_ICtCp_glsl
 #define INCLUDE_util_colors_ICtCp_glsl a
 
-#include "/util/Colors2.glsl"
+#include "../Colors2.glsl"
 
 // -------------------------------------------------- Matrices --------------------------------------------------
 

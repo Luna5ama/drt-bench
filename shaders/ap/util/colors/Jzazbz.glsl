@@ -8,7 +8,7 @@
 #ifndef INCLUDE_util_colors_Jzazbz_glsl
 #define INCLUDE_util_colors_Jzazbz_glsl a
 
-#include "/util/Math.glsl"
+#include "../Math.glsl"
 
 // -------------------------------------------------- Constants --------------------------------------------------
 
