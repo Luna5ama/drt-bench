@@ -590,6 +590,7 @@ private:
         uploadTexture(gray, sizeof(gray), 1, 1, VK_FORMAT_R32G32B32A32_SFLOAT);
 
         const fs::path defaultShader = executableDir_ / "passthrough" / "main.glsl";
+        shaderIncludeRoot_ = defaultShader.parent_path();
         if (!loadShader(defaultShader, true)) {
             throw std::runtime_error("failed to compile bundled passthrough/main.glsl");
         }
@@ -945,9 +946,9 @@ private:
         throw std::runtime_error("glslc.exe not found; install the Vulkan SDK or add glslc to PATH");
     }
 
-    bool compilePipeline(const fs::path& path, bool hdr, VkPipeline& result) {
+    bool compilePipeline(const fs::path& path, const fs::path& includeRoot, bool hdr, VkPipeline& result) {
         try {
-            const std::string source = expandShaderIncludes(path, path.parent_path());
+            const std::string source = expandShaderIncludes(path, includeRoot);
             std::ofstream composite(tempSource_, std::ios::binary | std::ios::trunc);
             composite << "#version 460\n";
             composite << (hdr ? "#define DRT_BENCH_HDR 1\n" : "#define DRT_BENCH_SDR 1\n");
@@ -1032,7 +1033,7 @@ private:
         }
         VkPipeline replacement = VK_NULL_HANDLE;
         shaderPath_ = fs::absolute(path);
-        const bool compiled = compilePipeline(shaderPath_, hdr_, replacement);
+        const bool compiled = compilePipeline(shaderPath_, shaderIncludeRoot_, hdr_, replacement);
         lastShaderReload_ = std::chrono::steady_clock::now();
         if (!compiled) return false;
         vkDeviceWaitIdle(device_);
@@ -1358,6 +1359,7 @@ private:
 
     void loadShaderDirectory(const fs::path& directory) {
         shaderDirectory_ = fs::absolute(directory);
+        shaderIncludeRoot_ = shaderDirectory_;
         shaderPath_ = shaderDirectory_ / "main.glsl";
         std::error_code error;
         if (!fs::is_regular_file(shaderPath_, error) || error) {
@@ -1436,7 +1438,7 @@ private:
     void setHdr(bool enabled) {
         if (hdr_ == enabled) return;
         VkPipeline replacement = VK_NULL_HANDLE;
-        if (!compilePipeline(shaderPath_, enabled, replacement)) {
+        if (!compilePipeline(shaderPath_, shaderIncludeRoot_, enabled, replacement)) {
             std::cerr << "display mode unchanged because shader recompilation failed\n";
             return;
         }
@@ -1500,6 +1502,7 @@ private:
     int initialHeight_ = 720;
     fs::path shaderPath_;
     fs::path shaderDirectory_;
+    fs::path shaderIncludeRoot_;
     ShaderFileSnapshot observedShaderFiles_;
     std::chrono::steady_clock::time_point lastShaderReload_{};
     std::chrono::steady_clock::time_point lastShaderChange_{};
@@ -1562,21 +1565,21 @@ int selfTest() {
 
     const fs::path includeRoot = fs::temp_directory_path() /
         ("drt-bench-include-test-" + std::to_string(GetCurrentProcessId()));
-    fs::create_directories(includeRoot / "local");
+    fs::create_directories(includeRoot / "entry" / "local");
     {
         std::ofstream(includeRoot / "root.glsl") << "float rootValue = 1.0;\n";
-        std::ofstream(includeRoot / "local" / "nested.glsl") <<
+        std::ofstream(includeRoot / "entry" / "local" / "nested.glsl") <<
             "#include \"/root.glsl\"\nfloat nestedValue = rootValue;\n";
-        std::ofstream(includeRoot / "entry.glsl") << "#include \"local/nested.glsl\"\n";
+        std::ofstream(includeRoot / "entry" / "entry.glsl") << "#include \"local/nested.glsl\"\n";
     }
     const auto initialShaderFiles = shaderFileSnapshot(includeRoot);
-    std::ofstream(includeRoot / "local" / "included.glsl", std::ios::app) << "\n";
+    std::ofstream(includeRoot / "entry" / "local" / "included.glsl", std::ios::app) << "\n";
     const auto updatedShaderFiles = shaderFileSnapshot(includeRoot);
     if (initialShaderFiles == updatedShaderFiles) {
         std::cerr << "self-test failed: shader directory changes were not observed\n";
         return 1;
     }
-    const std::string expanded = expandShaderIncludes(includeRoot / "entry.glsl", includeRoot);
+    const std::string expanded = expandShaderIncludes(includeRoot / "entry" / "entry.glsl", includeRoot);
     std::error_code includeError;
     fs::remove_all(includeRoot, includeError);
     if (expanded.find("#include") != std::string::npos ||

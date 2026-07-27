@@ -1,7 +1,7 @@
 #ifndef INCLUDE_techniques_drt_Common_glsl
 #define INCLUDE_techniques_drt_Common_glsl a
 
-#include "../../util/Colors2.glsl"
+#include "/util/Colors2.glsl"
 
 #define USE_LOOK 0
 

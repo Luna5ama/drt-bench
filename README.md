@@ -77,7 +77,7 @@ layout(set = 0, binding = 1) uniform writeonly image2D uimg_outputTex;
 
 The shader supplies `main()`. `usam_inputTex` uses linear filtering with clamp-to-edge addressing. `uimg_outputTex` is the acquired swapchain image, so `imageSize(uimg_outputTex)` is the window size. In HDR10 mode the shader should write display-ready ST.2084 values.
 
-`/loaddrt` loads `<directory>/main.glsl` as the entry point and watches every file below that directory, including includes. Changes are debounced for 100ms; after a reload completes, the next reload waits at least 500ms. Successful recompiles redraw immediately; failed recompiles keep the last working pipeline.
+`/loaddrt` loads `<directory>/main.glsl` as the entry point and uses `<directory>` as the shader include root: `#include "/util/Colors2.glsl"` resolves to `<directory>/util/Colors2.glsl`. Relative includes remain relative to the including file. It watches every file below that directory, including includes. Changes are debounced for 100ms; after a reload completes, the next reload waits at least 500ms. Successful recompiles redraw immediately; failed recompiles keep the last working pipeline.
 
 ## Alpha-Piscium DRT
 

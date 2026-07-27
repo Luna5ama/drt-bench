@@ -13,7 +13,7 @@
         EOTF: Electro-Optical Transfer Function (decoding gamma, non-linear to linear)
         OETF: Opto-Electronic Transfer Function (encoding gamma, linear to non-linear)
 */
-#include "../Math.glsl"
+#include "/util/Math.glsl"
 
 // -------------------------------------------------------- API --------------------------------------------------------
 #define COLORS2_TF_IDENTITY 0
