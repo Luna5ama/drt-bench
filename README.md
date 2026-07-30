@@ -1,6 +1,6 @@
 # drt-bench
 
-Minimal Windows Vulkan bench for iterating on compute-based DRT shaders. It opens a centered 1280x720 borderless window and only submits a frame after input, shader, display mode, exposure, or window state changes.
+Minimal Windows Vulkan bench for iterating on compute-based DRT shaders. It opens a centered 1280x720 borderless window and only submits a frame after input, shader, display mode, exposure, or window state changes. A floating `Output RGB Cube` tool window plots sampled output pixels in an isometric projection with red and green across the horizontal plane and blue vertical.
 
 ## License
 

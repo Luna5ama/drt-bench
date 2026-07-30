@@ -4,6 +4,8 @@
 #include <webp/encode.h>
 #include <tinyexr.h>
 
+#include "rgb_cube.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -358,6 +360,7 @@ public:
     App(const fs::path& executable, const StartupOptions& options)
         : executableDir_(executable.parent_path()), initialWidth_(options.width), initialHeight_(options.height) {
         createWindow();
+        rgbCube_.create(window_);
         initVulkan();
         if (options.drt) loadShaderDirectory(pathFromUtf8(*options.drt));
         if (options.exr) loadExr(*options.exr);
@@ -1093,20 +1096,23 @@ private:
         vkCheck(vkResetFences(device_, 1, &renderFence_), "vkResetFences");
         vkCheck(vkResetCommandBuffer(commandBuffer_, 0), "vkResetCommandBuffer");
 
-        bool capture = screenshotPending_;
-        if (capture && hdr_ &&
+        bool screenshot = screenshotPending_;
+        if (screenshot && hdr_ &&
             (swapchainFormat_ != VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
              colorSpace_ != VK_COLOR_SPACE_HDR10_ST2084_EXT)) {
             std::cerr << "screenshot failed: HDR PNG requires an HDR10 ST2084 A2B10G10R10 swapchain\n";
-            capture = false;
+            screenshot = false;
             screenshotPending_ = false;
         }
-        if (capture && !hdr_ && swapchainFormat_ != VK_FORMAT_R8G8B8A8_UNORM &&
+        if (screenshot && !hdr_ && swapchainFormat_ != VK_FORMAT_R8G8B8A8_UNORM &&
             swapchainFormat_ != VK_FORMAT_B8G8R8A8_UNORM) {
             std::cerr << "screenshot failed: lossless WebP requires an RGBA8 or BGRA8 swapchain\n";
-            capture = false;
+            screenshot = false;
             screenshotPending_ = false;
         }
+        const bool visualize = rgbCube_.visible() && RgbCubeWindow::supports(swapchainFormat_);
+        if (rgbCube_.visible() && !visualize) rgbCube_.clear();
+        const bool capture = screenshot || visualize;
         VkBuffer readback = VK_NULL_HANDLE;
         VkDeviceMemory readbackMemory = VK_NULL_HANDLE;
         const VkDeviceSize readbackSize = static_cast<VkDeviceSize>(extent_.width) * extent_.height * 4;
@@ -1218,12 +1224,13 @@ private:
         present.pImageIndices = &imageIndex;
         const VkResult presented = vkQueuePresentKHR(queue_, &present);
         if (capture) {
-            screenshotPending_ = false;
+            if (screenshot) screenshotPending_ = false;
             vkCheck(vkWaitForFences(device_, 1, &renderFence_, VK_TRUE, UINT64_MAX), "vkWaitForFences");
             void* mapped = nullptr;
             try {
                 vkCheck(vkMapMemory(device_, readbackMemory, 0, readbackSize, 0, &mapped), "vkMapMemory");
-                saveScreenshot(mapped);
+                if (screenshot) saveScreenshot(mapped);
+                if (visualize) rgbCube_.update(mapped, extent_.width, extent_.height, swapchainFormat_);
                 vkUnmapMemory(device_, readbackMemory);
             } catch (const std::exception& error) {
                 if (mapped) vkUnmapMemory(device_, readbackMemory);
@@ -1466,6 +1473,7 @@ private:
     bool reloadRequested_ = false;
     bool hdrToggleRequested_ = false;
     bool screenshotPending_ = false;
+    RgbCubeWindow rgbCube_;
     std::shared_ptr<CommandState> commandState_ = std::make_shared<CommandState>();
     HANDLE consoleInput_ = INVALID_HANDLE_VALUE;
     DWORD consoleInputMode_ = 0;
@@ -1549,6 +1557,15 @@ int selfTest() {
     };
     for (const auto& test : hitTests) {
         if (windowHitTest(windowBounds, test.point, 8, 8) != test.expected) return 1;
+    }
+    const RgbCubePoint rgbOrigin = projectRgbCube(0.0f, 0.0f, 0.0f);
+    const RgbCubePoint rgbRed = projectRgbCube(1.0f, 0.0f, 0.0f);
+    const RgbCubePoint rgbGreen = projectRgbCube(0.0f, 1.0f, 0.0f);
+    const RgbCubePoint rgbBlue = projectRgbCube(0.0f, 0.0f, 1.0f);
+    if (rgbOrigin.x != rgbBlue.x || rgbOrigin.y >= rgbBlue.y ||
+        rgbOrigin.x >= rgbRed.x || rgbOrigin.x >= rgbGreen.x || rgbGreen.y >= rgbOrigin.y) {
+        std::cerr << "self-test failed: RGB cube orientation is invalid\n";
+        return 1;
     }
     constexpr uint32_t width = 1280;
     constexpr uint32_t height = 720;
