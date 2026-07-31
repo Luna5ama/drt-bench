@@ -5,6 +5,7 @@
 #include <tinyexr.h>
 
 #include "rgb_cube.hpp"
+#include "settings_window.hpp"
 
 #include <algorithm>
 #include <array>
@@ -120,16 +121,29 @@ std::vector<std::byte> readFile(const fs::path& path) {
     return bytes;
 }
 
-std::string expandShaderIncludes(const fs::path& path, const fs::path& root,
-                                 std::vector<fs::path> stack = {}) {
+std::string expandShaderIncludes(
+    const fs::path& path, const fs::path& root, std::vector<fs::path> stack = {},
+    const fs::path* settingsEntry = nullptr,
+    const std::vector<shader_settings::Setting>* settings = nullptr) {
     const fs::path canonical = fs::weakly_canonical(path);
     if (std::find(stack.begin(), stack.end(), canonical) != stack.end()) {
         throw std::runtime_error("cyclic shader include: " + canonical.string());
     }
     stack.push_back(canonical);
 
-    std::ifstream file(canonical, std::ios::binary);
-    if (!file) throw std::runtime_error("cannot open shader " + canonical.string());
+    std::ifstream input(canonical, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open shader " + canonical.string());
+    std::ostringstream sourceStream;
+    sourceStream << input.rdbuf();
+    std::string source = sourceStream.str();
+    const auto definitions = shader_settings::parse(source);
+    if (!definitions.empty()) {
+        if (!settingsEntry || canonical != fs::weakly_canonical(*settingsEntry) || !settings) {
+            throw std::runtime_error(
+                "Iris-style runtime settings may only be defined in main.glsl: " + canonical.string());
+        }
+    }
+    std::istringstream file(source);
 
     std::string expanded;
     std::string line;
@@ -153,7 +167,7 @@ std::string expandShaderIncludes(const fs::path& path, const fs::path& root,
         const fs::path includePath = includeName.has_root_directory()
             ? root / includeName.relative_path()
             : canonical.parent_path() / includeName;
-        expanded += expandShaderIncludes(includePath, root, stack);
+        expanded += expandShaderIncludes(includePath, root, stack, settingsEntry, settings);
     }
     return expanded;
 }
@@ -177,6 +191,22 @@ std::optional<SIZE> parseWindowSize(std::string_view text) {
         return std::nullopt;
     }
     return size;
+}
+
+std::optional<CubeSpace> parseCubeSpace(std::string_view text) {
+    static constexpr std::pair<std::string_view, CubeSpace> spaces[] = {
+        {"rgb", CubeSpace::rgb},
+        {"xyy", CubeSpace::xyY},
+        {"cieyuv", CubeSpace::cieYuv},
+        {"cieluv", CubeSpace::cieLuv},
+        {"cielab", CubeSpace::cieLab},
+        {"cielch", CubeSpace::cieLch},
+        {"jzazbz", CubeSpace::jzAzBz},
+        {"jzczhz", CubeSpace::jzCzHz},
+    };
+    const auto match = std::find_if(std::begin(spaces), std::end(spaces),
+                                    [text](const auto& entry) { return entry.first == text; });
+    return match == std::end(spaces) ? std::nullopt : std::optional(match->second);
 }
 
 struct StartupOptions {
@@ -361,16 +391,18 @@ public:
     App(const fs::path& executable, const StartupOptions& options)
         : executableDir_(executable.parent_path()), initialWidth_(options.width), initialHeight_(options.height) {
         createWindow();
-        for (std::size_t index = 0; index < colorCubes_.size(); ++index) {
-            colorCubes_[index].create(window_, static_cast<CubeSpace>(index));
-        }
+        createCube(CubeSpace::rgb);
+        createCube(CubeSpace::xyY);
+        settingsWindow_.create(window_, [this](std::size_t setting, std::size_t value) {
+            changeShaderSetting(setting, value);
+        });
         initVulkan();
         if (options.drt) loadShaderDirectory(pathFromUtf8(*options.drt));
         if (options.exr) loadExr(*options.exr);
         if (options.fp16) loadRaw(*options.fp16, 2, VK_FORMAT_R16G16B16A16_SFLOAT);
         if (options.fp32) loadRaw(*options.fp32, 4, VK_FORMAT_R32G32B32A32_SFLOAT);
         startStdin();
-        std::cout << "commands: /loadexr /loadfp16 /loadfp32 /loaddrt /sdr /hdr /screenshot /resize\n";
+        std::cout << "commands: /loadexr /loadfp16 /loadfp32 /loaddrt /sdr /hdr /screenshot /resize /cube\n";
     }
 
     ~App() {
@@ -378,6 +410,7 @@ public:
         commandState_->window = nullptr;
         if (consoleInput_ != INVALID_HANDLE_VALUE) SetConsoleMode(consoleInput_, consoleInputMode_);
         if (device_) vkDeviceWaitIdle(device_);
+        destroyShaderSettingsBuffer();
         destroyTexture(input_);
         if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
         if (pipelineLayout_) vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
@@ -603,7 +636,7 @@ private:
     }
 
     void createDescriptors() {
-        VkDescriptorSetLayoutBinding bindings[2]{};
+        VkDescriptorSetLayoutBinding bindings[3]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[0].descriptorCount = 1;
@@ -612,8 +645,12 @@ private:
         bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         bindings[1].descriptorCount = 1;
         bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[2].binding = 2;
+        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[2].descriptorCount = 1;
+        bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        layoutInfo.bindingCount = 2;
+        layoutInfo.bindingCount = 3;
         layoutInfo.pBindings = bindings;
         vkCheck(vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &descriptorLayout_),
                 "vkCreateDescriptorSetLayout");
@@ -627,10 +664,11 @@ private:
         VkDescriptorPoolSize sizes[] = {
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
         };
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 2;
+        poolInfo.poolSizeCount = 3;
         poolInfo.pPoolSizes = sizes;
         vkCheck(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &descriptorPool_), "vkCreateDescriptorPool");
         VkDescriptorSetAllocateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -834,6 +872,94 @@ private:
         }
     }
 
+    void destroyShaderSettingsBuffer() {
+        if (!device_) return;
+        if (settingsBuffer_) vkDestroyBuffer(device_, settingsBuffer_, nullptr);
+        if (settingsMemory_) vkFreeMemory(device_, settingsMemory_, nullptr);
+        settingsBuffer_ = VK_NULL_HANDLE;
+        settingsMemory_ = VK_NULL_HANDLE;
+        settingsBufferSize_ = 0;
+    }
+
+    void uploadShaderSettings() {
+        if (!settingsMemory_) return;
+        vkCheck(vkWaitForFences(device_, 1, &renderFence_, VK_TRUE, UINT64_MAX),
+                "vkWaitForFences(shader settings)");
+        const std::vector<float> values = shader_settings::packedValues(shaderSettings_);
+        void* mapped = nullptr;
+        vkCheck(vkMapMemory(device_, settingsMemory_, 0, settingsBufferSize_, 0, &mapped),
+                "vkMapMemory(shader settings)");
+        std::memcpy(mapped, values.data(), static_cast<std::size_t>(settingsBufferSize_));
+        vkUnmapMemory(device_, settingsMemory_);
+    }
+
+    void replaceShaderSettings(std::vector<shader_settings::Setting> settings) {
+        const std::vector<float> values = shader_settings::packedValues(settings);
+        const VkDeviceSize size = static_cast<VkDeviceSize>(values.size() * sizeof(float));
+        VkBuffer replacementBuffer = VK_NULL_HANDLE;
+        VkDeviceMemory replacementMemory = VK_NULL_HANDLE;
+        createHostBuffer(size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                         replacementBuffer, replacementMemory);
+        void* mapped = nullptr;
+        try {
+            vkCheck(vkMapMemory(device_, replacementMemory, 0, size, 0, &mapped),
+                    "vkMapMemory(shader settings)");
+            std::memcpy(mapped, values.data(), static_cast<std::size_t>(size));
+            vkUnmapMemory(device_, replacementMemory);
+            mapped = nullptr;
+        } catch (...) {
+            if (mapped) vkUnmapMemory(device_, replacementMemory);
+            vkDestroyBuffer(device_, replacementBuffer, nullptr);
+            vkFreeMemory(device_, replacementMemory, nullptr);
+            throw;
+        }
+
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = replacementBuffer;
+        bufferInfo.range = size;
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = descriptorSet_;
+        write.dstBinding = 2;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        write.pBufferInfo = &bufferInfo;
+        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+
+        destroyShaderSettingsBuffer();
+        settingsBuffer_ = replacementBuffer;
+        settingsMemory_ = replacementMemory;
+        settingsBufferSize_ = size;
+        shaderSettings_ = std::move(settings);
+        settingsWindow_.setSettings(shaderSettings_);
+        const std::size_t compileTimeCount = static_cast<std::size_t>(std::count_if(
+            shaderSettings_.begin(), shaderSettings_.end(),
+            [](const shader_settings::Setting& setting) { return setting.compileTime; }));
+        std::cout << "shader settings: " << shaderSettings_.size() << " option(s) ("
+                  << shaderSettings_.size() - compileTimeCount << " UBO, "
+                  << compileTimeCount << " compile-time)\n";
+    }
+
+    void changeShaderSetting(std::size_t setting, std::size_t value) {
+        if (setting >= shaderSettings_.size() || value >= shaderSettings_[setting].values.size()) return;
+        const std::size_t previous = shaderSettings_[setting].selected;
+        const bool compileTime = shaderSettings_[setting].compileTime;
+        const std::string name = shaderSettings_[setting].name;
+        const std::string token = shaderSettings_[setting].valueTokens[value];
+        shaderSettings_[setting].selected = value;
+        if (compileTime) {
+            if (!loadShader(shaderPath_, true)) {
+                shaderSettings_[setting].selected = previous;
+                settingsWindow_.setSettings(shaderSettings_);
+                return;
+            }
+            std::cout << "setting " << name << " = " << token << " (shader recompiled)\n";
+            return;
+        }
+        uploadShaderSettings();
+        dirty_ = true;
+        std::cout << "setting " << name << " = " << token << '\n';
+    }
+
     void uploadTexture(const void* pixels, size_t byteCount, uint32_t width, uint32_t height, VkFormat format) {
         VkFormatProperties formatProperties{};
         vkGetPhysicalDeviceFormatProperties(physicalDevice_, format, &formatProperties);
@@ -952,16 +1078,27 @@ private:
         throw std::runtime_error("glslc.exe not found; install the Vulkan SDK or add glslc to PATH");
     }
 
-    bool compilePipeline(const fs::path& path, const fs::path& includeRoot, bool hdr, VkPipeline& result) {
+    bool compilePipeline(const fs::path& path, const fs::path& includeRoot, bool hdr,
+                         VkPipeline& result,
+                         std::vector<shader_settings::Setting>& compiledSettings) {
         try {
-            const std::string source = expandShaderIncludes(path, includeRoot);
+            const auto entryBytes = readFile(path);
+            const std::string entrySource(reinterpret_cast<const char*>(entryBytes.data()), entryBytes.size());
+            compiledSettings = shader_settings::parse(entrySource);
+            shader_settings::localize(compiledSettings,
+                                      shader_settings::englishLanguagePath(includeRoot));
+            shader_settings::preserveSelections(compiledSettings, shaderSettings_);
+            std::string source =
+                expandShaderIncludes(path, includeRoot, {}, &path, &compiledSettings);
+            source = shader_settings::patch(source, compiledSettings);
             std::ofstream composite(tempSource_, std::ios::binary | std::ios::trunc);
             composite << "#version 460\n";
             composite << (hdr ? "#define DRT_BENCH_HDR 1\n" : "#define DRT_BENCH_SDR 1\n");
             composite << "layout(local_size_x = 8, local_size_y = 8) in;\n"
                          "layout(set = 0, binding = 0) uniform sampler2D usam_inputTex;\n"
-                         "layout(set = 0, binding = 1) uniform writeonly image2D uimg_outputTex;\n"
-                         "#line 1\n";
+                         "layout(set = 0, binding = 1) uniform writeonly image2D uimg_outputTex;\n";
+            composite << shader_settings::uniformDeclaration(compiledSettings.size());
+            composite << "#line 1\n";
             composite << source;
             composite.close();
 
@@ -1038,11 +1175,14 @@ private:
             return true;
         }
         VkPipeline replacement = VK_NULL_HANDLE;
+        std::vector<shader_settings::Setting> replacementSettings;
         shaderPath_ = fs::absolute(path);
-        const bool compiled = compilePipeline(shaderPath_, shaderIncludeRoot_, hdr_, replacement);
+        const bool compiled = compilePipeline(shaderPath_, shaderIncludeRoot_, hdr_,
+                                              replacement, replacementSettings);
         lastShaderReload_ = std::chrono::steady_clock::now();
         if (!compiled) return false;
         vkDeviceWaitIdle(device_);
+        replaceShaderSettings(std::move(replacementSettings));
         if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
         pipeline_ = replacement;
         shaderReloadPending_ = false;
@@ -1115,10 +1255,10 @@ private:
         }
         const bool supported = ColorCubeWindow::supports(swapchainFormat_);
         bool visualize = false;
-        for (ColorCubeWindow& cube : colorCubes_) {
-            if (!cube.visible()) continue;
+        for (const auto& cube : colorCubes_) {
+            if (!cube->visible()) continue;
             if (supported) visualize = true;
-            else cube.clear();
+            else cube->clear();
         }
         const bool capture = screenshot || visualize;
         VkBuffer readback = VK_NULL_HANDLE;
@@ -1241,10 +1381,10 @@ private:
                 if (visualize) {
                     const float peakRelative = ColorCubeWindow::peakRelative(
                         mapped, extent_.width, extent_.height, swapchainFormat_);
-                    for (ColorCubeWindow& cube : colorCubes_) {
-                        if (cube.visible()) {
-                            cube.update(mapped, extent_.width, extent_.height,
-                                        swapchainFormat_, peakRelative);
+                    for (const auto& cube : colorCubes_) {
+                        if (cube->visible()) {
+                            cube->update(mapped, extent_.width, extent_.height,
+                                         swapchainFormat_, peakRelative);
                         }
                     }
                 }
@@ -1363,6 +1503,13 @@ private:
                     dirty_ = true;
                 } else if (command == "/resize") {
                     resizeWindow(argument);
+                } else if (command == "/cube") {
+                    const auto space = parseCubeSpace(argument);
+                    if (!space) {
+                        throw std::runtime_error(
+                            "usage: /cube <rgb|xyy|cieyuv|cieluv|cielab|cielch|jzazbz|jzczhz>");
+                    }
+                    createCube(*space);
                 } else if (!trim(line).empty()) {
                     std::cerr << "unknown command: " << command << '\n';
                 }
@@ -1379,6 +1526,15 @@ private:
                           SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) {
             throw std::runtime_error("SetWindowPos failed");
         }
+    }
+
+    void createCube(CubeSpace space) {
+        std::erase_if(colorCubes_, [](const auto& cube) { return !cube->visible(); });
+        auto cube = std::make_unique<ColorCubeWindow>();
+        cube->create(window_, space, colorCubes_.size());
+        if (!cube->visible()) throw std::runtime_error("cube window creation failed");
+        colorCubes_.push_back(std::move(cube));
+        dirty_ = true;
     }
 
     void loadShaderDirectory(const fs::path& directory) {
@@ -1462,7 +1618,9 @@ private:
     void setHdr(bool enabled) {
         if (hdr_ == enabled) return;
         VkPipeline replacement = VK_NULL_HANDLE;
-        if (!compilePipeline(shaderPath_, shaderIncludeRoot_, enabled, replacement)) {
+        std::vector<shader_settings::Setting> compiledSettings;
+        if (!compilePipeline(shaderPath_, shaderIncludeRoot_, enabled,
+                             replacement, compiledSettings)) {
             std::cerr << "display mode unchanged because shader recompilation failed\n";
             return;
         }
@@ -1476,6 +1634,7 @@ private:
             recreateSwapchain();
             throw;
         }
+        replaceShaderSettings(std::move(compiledSettings));
         vkDestroyPipeline(device_, pipeline_, nullptr);
         pipeline_ = replacement;
         dirty_ = true;
@@ -1490,7 +1649,9 @@ private:
     bool reloadRequested_ = false;
     bool hdrToggleRequested_ = false;
     bool screenshotPending_ = false;
-    std::array<ColorCubeWindow, static_cast<std::size_t>(CubeSpace::count)> colorCubes_;
+    std::vector<std::unique_ptr<ColorCubeWindow>> colorCubes_;
+    ShaderSettingsWindow settingsWindow_;
+    std::vector<shader_settings::Setting> shaderSettings_;
     std::shared_ptr<CommandState> commandState_ = std::make_shared<CommandState>();
     HANDLE consoleInput_ = INVALID_HANDLE_VALUE;
     DWORD consoleInputMode_ = 0;
@@ -1510,6 +1671,9 @@ private:
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
+    VkBuffer settingsBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory settingsMemory_ = VK_NULL_HANDLE;
+    VkDeviceSize settingsBufferSize_ = 0;
     VkSampler sampler_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     Texture input_{};
@@ -1561,6 +1725,14 @@ int selfTest() {
     const auto resize = parseWindowSize("640 360");
     if (!resize || resize->cx != 640 || resize->cy != 360 ||
         parseWindowSize("640 0") || parseWindowSize("640 360 extra")) return 1;
+    if (parseCubeSpace("rgb") != CubeSpace::rgb ||
+        parseCubeSpace("xyy") != CubeSpace::xyY ||
+        parseCubeSpace("cieyuv") != CubeSpace::cieYuv ||
+        parseCubeSpace("cieluv") != CubeSpace::cieLuv ||
+        parseCubeSpace("cielab") != CubeSpace::cieLab ||
+        parseCubeSpace("cielch") != CubeSpace::cieLch ||
+        parseCubeSpace("jzazbz") != CubeSpace::jzAzBz ||
+        parseCubeSpace("jzczhz") != CubeSpace::jzCzHz || parseCubeSpace("invalid")) return 1;
     const RECT windowBounds{100, 100, 500, 400};
     const struct {
         POINT point;
@@ -1685,12 +1857,81 @@ int selfTest() {
         return 1;
     }
     const std::string expanded = expandShaderIncludes(includeRoot / "entry" / "entry.glsl", includeRoot);
-    std::error_code includeError;
-    fs::remove_all(includeRoot, includeError);
     if (expanded.find("#include") != std::string::npos ||
         expanded.find("rootValue") == std::string::npos ||
         expanded.find("nestedValue") == std::string::npos) {
         std::cerr << "self-test failed: shader includes were not expanded\n";
+        return 1;
+    }
+
+    const std::string settingsSource =
+        "#define TEST_GAIN 1.0//[0.0 0.5 1.0]\n"
+        "#define TEST_COUNT 2//[1 2 4]\n"
+        "#define COMPILE_TIME_ONLY 7\n";
+    auto settings = shader_settings::parse(settingsSource);
+    shader_settings::localize(settings, shader_settings::parseLanguage(
+        "option.TEST_GAIN=Localized Gain\n"
+        "option.TEST_GAIN.comment=Controls the test gain.\n"
+        "prefix.TEST_GAIN=2^-\n"
+        "suffix.TEST_GAIN= stops\n"
+        "value.TEST_GAIN.1.0=full\n"));
+    const std::string patched = shader_settings::patch(settingsSource, settings);
+    const auto packed = shader_settings::packedValues(settings);
+    if (settings.size() != 2 || settings[0].selected != 2 || settings[1].selected != 1 ||
+        settings[0].label != "Localized Gain" ||
+        settings[0].comment != "Controls the test gain." ||
+        shader_settings::displayValue(settings[0]) != "2^-full stops" ||
+        settings[0].integer || !settings[1].integer || packed.size() != 4 ||
+        packed[0] != 1.0f || packed[1] != 2.0f ||
+        patched.find("drtBenchSettings.values[0].x") == std::string::npos ||
+        patched.find("int(drtBenchSettings.values[0].y)") == std::string::npos ||
+        patched.find("#define COMPILE_TIME_ONLY 7") == std::string::npos ||
+        shader_settings::uniformDeclaration(5).find("vec4 values[2]") == std::string::npos) {
+        std::cerr << "self-test failed: Iris-style shader setting parsing is invalid\n";
+        return 1;
+    }
+    auto reloadedSettings = shader_settings::parse(settingsSource);
+    settings[0].selected = 1;
+    shader_settings::preserveSelections(reloadedSettings, settings);
+    if (reloadedSettings[0].selected != 1) {
+        std::cerr << "self-test failed: shader setting selection was not preserved\n";
+        return 1;
+    }
+    const std::string preprocessorSettingsSource =
+        settingsSource + "#if TEST_COUNT == 2\nconst int selectedCount = TEST_COUNT;\n#endif\n";
+    auto preprocessorSettings = shader_settings::parse(preprocessorSettingsSource);
+    const std::string patchedPreprocessor =
+        shader_settings::patch(preprocessorSettingsSource, preprocessorSettings);
+    if (patchedPreprocessor.find("#define TEST_COUNT 2\n") == std::string::npos ||
+        !preprocessorSettings[1].compileTime || preprocessorSettings[0].compileTime) {
+        std::cerr << "self-test failed: preprocessor shader setting was patched to a UBO read\n";
+        return 1;
+    }
+    preprocessorSettings[1].selected = 2;
+    const std::string changedPreprocessor =
+        shader_settings::patch(preprocessorSettingsSource, preprocessorSettings);
+    if (changedPreprocessor.find("#define TEST_COUNT 4\n") == std::string::npos) {
+        std::cerr << "self-test failed: compile-time shader setting selection was ignored\n";
+        return 1;
+    }
+    std::ofstream(includeRoot / "entry" / "entry.glsl") <<
+        "#define ENTRY_SETTING 1//[0 1]\n#include \"local/runtime.glsl\"\n";
+    std::ofstream(includeRoot / "entry" / "local" / "runtime.glsl") <<
+        "#define INCLUDED_SETTING 1.0//[0.0 1.0]\n";
+    bool rejectedIncludedSetting = false;
+    try {
+        const fs::path settingsEntry = includeRoot / "entry" / "entry.glsl";
+        const auto settingsEntryBytes = readFile(settingsEntry);
+        auto entrySettings = shader_settings::parse(std::string(
+            reinterpret_cast<const char*>(settingsEntryBytes.data()), settingsEntryBytes.size()));
+        (void)expandShaderIncludes(settingsEntry, includeRoot, {}, &settingsEntry, &entrySettings);
+    } catch (const std::exception&) {
+        rejectedIncludedSetting = true;
+    }
+    std::error_code includeError;
+    fs::remove_all(includeRoot, includeError);
+    if (!rejectedIncludedSetting) {
+        std::cerr << "self-test failed: included shader setting definition was accepted\n";
         return 1;
     }
 

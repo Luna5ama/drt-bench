@@ -1,6 +1,6 @@
 # drt-bench
 
-Minimal Windows Vulkan bench for iterating on compute-based DRT shaders. It opens a centered 1280x720 borderless window and only submits a frame after input, shader, display mode, exposure, or window state changes. Floating tool windows plot sampled output pixels in RGB, xyY, CIE YUV, CIELUV, CIELAB, CIELCh, JzAzBz, and JzCzHz cubes. Each view uses its two chromatic axes horizontally and its luminance or lightness axis vertically, with numeric labels at both ends of every axis. Jz follows the decoded image peak; Az, Bz, and Cz use the CIE 1931 visible-gamut bounds at that peak. Drag a cube with the left mouse button to rotate it, and right-click to reset its view.
+Minimal Windows Vulkan bench for iterating on compute-based DRT shaders. It opens a centered 1280x720 borderless window and only submits a frame after input, shader, display mode, exposure, or window state changes. Floating tool windows plot sampled output pixels in RGB, xyY, CIE YUV, CIELUV, CIELAB, CIELCh, JzAzBz, and JzCzHz cubes. RGB and xyY open at startup; `/cube <type>` opens additional cube windows, and each cube can be closed independently. Each view uses its two chromatic axes horizontally and its luminance or lightness axis vertically, with numeric labels at both ends of every axis. Jz follows the decoded image peak; Az, Bz, and Cz use the CIE 1931 visible-gamut bounds at that peak. Drag a cube with the left mouse button to rotate it, and right-click to reset its view.
 
 ## License
 
@@ -54,6 +54,7 @@ set the initial window and swapchain size before raw input is checked or loaded.
 /hdr
 /screenshot
 /resize <x> <y>
+/cube <rgb|xyy|cieyuv|cieluv|cielab|cielch|jzazbz|jzczhz>
 ```
 
 Paths may contain spaces; surrounding quotes are optional. Raw files are tightly packed, little-endian, row-major RGBA values and must contain exactly `window_width * window_height * 4` f16 or f32 components. EXR dimensions come from the file.
@@ -66,6 +67,23 @@ lossless WebP. HDR uses a 16-bit RGB PNG tagged as full-range Rec. 2020/PQ with 
 
 `/resize` sets the borderless window to the requested pixel width and height.
 
+`/cube` opens a new cube window for the requested color space. Multiple windows of the same type may be open at once.
+
+## Shader settings
+
+The always-open **Shader Settings** tool window recognizes Iris-style numeric options declared in the loaded DRT's `main.glsl`:
+
+```glsl
+#define SETTING_WATER_ROUGHNESS 9.0//[4.0 4.5 5.0 5.5 6.0 6.5 7.0 7.5 8.0 8.5 9.0]
+#define SETTING_SSS_SAMPLE_COUNT 6//[2 3 4 6 8 12 16]
+```
+
+Only numeric defines with a `//[...]` value list become controls. They must be defined directly in `main.glsl`; finding one in an included file is an error. Before compilation, ordinary expression settings are replaced with values from an injected std140 UBO at set 0, binding 2. Floating-point options remain floats and all-integer lists are exposed to GLSL as `int(...)`. Moving one of these sliders updates the UBO and redraws immediately without recompiling the shader.
+
+Settings referenced by preprocessor directives remain literal macros. Changing one automatically recompiles the shader, allowing Iris-style `#if SETTING_NAME == value` branches to work alongside runtime UBO settings.
+
+English UI text is loaded case-insensitively from `<DRT directory>\lang\en_US.lang`. Supported Iris keys are `option.<name>`, `option.<name>.comment`, `prefix.<name>`, `suffix.<name>`, and `value.<name>.<token>`. Missing entries fall back to the define name and source value token.
+
 ## Shader contract
 
 DRT files are GLSL compute-shader bodies without a `#version` line. The bench prepends:
@@ -77,6 +95,7 @@ DRT files are GLSL compute-shader bodies without a `#version` line. The bench pr
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D usam_inputTex;
 layout(set = 0, binding = 1) uniform writeonly image2D uimg_outputTex;
+layout(std140, set = 0, binding = 2) uniform DrtBenchSettings { ... } drtBenchSettings;
 ```
 
 The shader supplies `main()`. `usam_inputTex` uses linear filtering with clamp-to-edge addressing. `uimg_outputTex` is the acquired swapchain image, so `imageSize(uimg_outputTex)` is the window size. In HDR10 mode the shader should write display-ready ST.2084 values.

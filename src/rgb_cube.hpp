@@ -409,7 +409,7 @@ public:
         if (window_) DestroyWindow(window_);
     }
 
-    void create(HWND owner, CubeSpace space) {
+    void create(HWND owner, CubeSpace space, std::size_t placementIndex) {
         space_ = space;
         ranges_ = cubeRanges(space);
         const HINSTANCE module = GetModuleHandleW(nullptr);
@@ -427,9 +427,8 @@ public:
         RECT work{};
         GetWindowRect(owner, &ownerBounds);
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-        const std::size_t index = static_cast<std::size_t>(space);
-        const bool onRight = index % 2 == 0;
-        const int cascade = static_cast<int>(index / 2) * 28;
+        const bool onRight = placementIndex % 2 == 0;
+        const int cascade = static_cast<int>(placementIndex / 2) * 28;
         int x = onRight ? ownerBounds.right + 12 + cascade : ownerBounds.left - width - 12 - cascade;
         if (onRight && x + width > work.right) x = ownerBounds.left - width - 12 - cascade;
         if (!onRight && x < work.left) x = ownerBounds.right + 12 + cascade;
@@ -438,7 +437,7 @@ public:
                                  static_cast<int>(work.top), static_cast<int>(work.bottom) - height);
         window_ = CreateWindowExW(WS_EX_TOOLWINDOW, windowClass.lpszClassName,
                                   cubeDescription(space).title,
-                                  WS_CAPTION | WS_THICKFRAME,
+                                  WS_CAPTION | WS_THICKFRAME | WS_SYSMENU,
                                   x, y, width, height, owner, nullptr, module, this);
         if (window_) ShowWindow(window_, SW_SHOWNOACTIVATE);
     }
@@ -603,7 +602,9 @@ private:
             self->pitch_ = 0.0f;
             InvalidateRect(window, nullptr, FALSE);
             return 0;
-        case WM_CLOSE: return 0;
+        case WM_CLOSE:
+            DestroyWindow(window);
+            return 0;
         case WM_NCDESTROY:
             self->window_ = nullptr;
             return DefWindowProcW(window, message, wparam, lparam);
