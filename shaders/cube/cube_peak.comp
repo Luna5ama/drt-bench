@@ -1,0 +1,38 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D sourceImage;
+layout(std430, set = 0, binding = 1) buffer PeakBuffer {
+    uint peakBits;
+};
+layout(push_constant) uniform PeakParameters {
+    uint hdr;
+} parameters;
+
+float decodeDisplayValue(float value) {
+    if (parameters.hdr == 0u) {
+        return value <= 0.04045 ? value / 12.92 :
+            pow((value + 0.055) / 1.055, 2.4);
+    }
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    const float p = pow(value, 1.0 / m2);
+    return pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = textureSize(sourceImage, 0);
+    if (any(greaterThanEqual(pixel, size))) return;
+    const vec3 linear = vec3(
+        decodeDisplayValue(texelFetch(sourceImage, pixel, 0).r),
+        decodeDisplayValue(texelFetch(sourceImage, pixel, 0).g),
+        decodeDisplayValue(texelFetch(sourceImage, pixel, 0).b));
+    const float luminance = parameters.hdr != 0u
+        ? dot(linear, vec3(0.2627002120, 0.6779980715, 0.0593017165))
+        : dot(linear, vec3(0.2126390059, 0.7151686788, 0.0721923154));
+    atomicMax(peakBits, floatBitsToUint(max(luminance, 0.0)));
+}
