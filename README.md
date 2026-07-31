@@ -1,6 +1,6 @@
 # drt-bench
 
-Minimal Windows Vulkan bench for iterating on compute-based DRT shaders. It opens a centered 1280x720 borderless window and only submits a frame after input, shader, display mode, exposure, or window state changes. A floating `Output RGB Cube` tool window plots sampled output pixels in an isometric projection with red and green across the horizontal plane and blue vertical.
+Minimal Windows Vulkan bench for iterating on compute-based DRT shaders. It opens a centered 1280x720 borderless window and only submits a frame after input, shader, display mode, exposure, or window state changes. Floating tool windows plot sampled output pixels in RGB, xyY, CIE YUV, CIELUV, CIELAB, CIELCh, JzAzBz, and JzCzHz cubes. Each view uses its two chromatic axes horizontally and its luminance or lightness axis vertically, with numeric labels at both ends of every axis. Jz follows the decoded image peak; Az, Bz, and Cz use the CIE 1931 visible-gamut bounds at that peak. Drag a cube with the left mouse button to rotate it, and right-click to reset its view.
 
 ## License
 

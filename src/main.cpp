@@ -7,6 +7,7 @@
 #include "rgb_cube.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <charconv>
@@ -360,7 +361,9 @@ public:
     App(const fs::path& executable, const StartupOptions& options)
         : executableDir_(executable.parent_path()), initialWidth_(options.width), initialHeight_(options.height) {
         createWindow();
-        rgbCube_.create(window_);
+        for (std::size_t index = 0; index < colorCubes_.size(); ++index) {
+            colorCubes_[index].create(window_, static_cast<CubeSpace>(index));
+        }
         initVulkan();
         if (options.drt) loadShaderDirectory(pathFromUtf8(*options.drt));
         if (options.exr) loadExr(*options.exr);
@@ -1110,8 +1113,13 @@ private:
             screenshot = false;
             screenshotPending_ = false;
         }
-        const bool visualize = rgbCube_.visible() && RgbCubeWindow::supports(swapchainFormat_);
-        if (rgbCube_.visible() && !visualize) rgbCube_.clear();
+        const bool supported = ColorCubeWindow::supports(swapchainFormat_);
+        bool visualize = false;
+        for (ColorCubeWindow& cube : colorCubes_) {
+            if (!cube.visible()) continue;
+            if (supported) visualize = true;
+            else cube.clear();
+        }
         const bool capture = screenshot || visualize;
         VkBuffer readback = VK_NULL_HANDLE;
         VkDeviceMemory readbackMemory = VK_NULL_HANDLE;
@@ -1230,7 +1238,16 @@ private:
             try {
                 vkCheck(vkMapMemory(device_, readbackMemory, 0, readbackSize, 0, &mapped), "vkMapMemory");
                 if (screenshot) saveScreenshot(mapped);
-                if (visualize) rgbCube_.update(mapped, extent_.width, extent_.height, swapchainFormat_);
+                if (visualize) {
+                    const float peakRelative = ColorCubeWindow::peakRelative(
+                        mapped, extent_.width, extent_.height, swapchainFormat_);
+                    for (ColorCubeWindow& cube : colorCubes_) {
+                        if (cube.visible()) {
+                            cube.update(mapped, extent_.width, extent_.height,
+                                        swapchainFormat_, peakRelative);
+                        }
+                    }
+                }
                 vkUnmapMemory(device_, readbackMemory);
             } catch (const std::exception& error) {
                 if (mapped) vkUnmapMemory(device_, readbackMemory);
@@ -1473,7 +1490,7 @@ private:
     bool reloadRequested_ = false;
     bool hdrToggleRequested_ = false;
     bool screenshotPending_ = false;
-    RgbCubeWindow rgbCube_;
+    std::array<ColorCubeWindow, static_cast<std::size_t>(CubeSpace::count)> colorCubes_;
     std::shared_ptr<CommandState> commandState_ = std::make_shared<CommandState>();
     HANDLE consoleInput_ = INVALID_HANDLE_VALUE;
     DWORD consoleInputMode_ = 0;
@@ -1558,13 +1575,84 @@ int selfTest() {
     for (const auto& test : hitTests) {
         if (windowHitTest(windowBounds, test.point, 8, 8) != test.expected) return 1;
     }
-    const RgbCubePoint rgbOrigin = projectRgbCube(0.0f, 0.0f, 0.0f);
-    const RgbCubePoint rgbRed = projectRgbCube(1.0f, 0.0f, 0.0f);
-    const RgbCubePoint rgbGreen = projectRgbCube(0.0f, 1.0f, 0.0f);
-    const RgbCubePoint rgbBlue = projectRgbCube(0.0f, 0.0f, 1.0f);
+    const CubePoint rgbOrigin = projectCube(0.0f, 0.0f, 0.0f);
+    const CubePoint rgbRed = projectCube(1.0f, 0.0f, 0.0f);
+    const CubePoint rgbGreen = projectCube(0.0f, 1.0f, 0.0f);
+    const CubePoint rgbBlue = projectCube(0.0f, 0.0f, 1.0f);
+    const CubePoint yawedFirst = projectCube(1.0f, 0.5f, 0.5f, 1.0f, 0.0f);
+    const CubePoint unrotatedSecond = projectCube(0.5f, 1.0f, 0.5f);
     if (rgbOrigin.x != rgbBlue.x || rgbOrigin.y >= rgbBlue.y ||
-        rgbOrigin.x >= rgbRed.x || rgbOrigin.x >= rgbGreen.x || rgbGreen.y >= rgbOrigin.y) {
+        rgbOrigin.x >= rgbRed.x || rgbOrigin.x >= rgbGreen.x || rgbGreen.y >= rgbOrigin.y ||
+        std::abs(yawedFirst.x - unrotatedSecond.x) > 0.0001f ||
+        std::abs(yawedFirst.y - unrotatedSecond.y) > 0.0001f) {
         std::cerr << "self-test failed: RGB cube orientation is invalid\n";
+        return 1;
+    }
+    const Xyz whiteXyz = rgbToXyz(1.0f, 1.0f, 1.0f, false);
+    const XyY whiteXyY = xyzToXyY(whiteXyz);
+    const ColorTriplet whiteYuv = xyzToCieYuv(whiteXyz);
+    const ColorTriplet whiteLab = xyzToCieLab(whiteXyz);
+    const ColorTriplet whiteLuv = xyzToCieLuv(whiteXyz);
+    const ColorTriplet whiteLch = rawCubeCoordinates(CubeSpace::cieLch, whiteXyz, false);
+    const ColorTriplet redLch =
+        rawCubeCoordinates(CubeSpace::cieLch, rgbToXyz(1.0f, 0.0f, 0.0f, false), false);
+    const ColorTriplet blackJz = xyzToJzAzBz({}, false);
+    const ColorTriplet blackJzCzHz = cubeCoordinates(CubeSpace::jzCzHz, {}, false);
+    const CubeRanges blackPeakJz = cubeRanges(CubeSpace::jzAzBz, false, 0.0f);
+    const CubeRanges halfPeakJz = cubeRanges(CubeSpace::jzAzBz, false, 0.5f);
+    const CubeRanges fullPeakJz = cubeRanges(CubeSpace::jzAzBz, false, 1.0f);
+    const uint32_t rgbaPeak = 0xff804000u;
+    const uint32_t rgbaBlue = 0xffff0000u;
+    const uint32_t hdrBlue = 1023u << 20;
+    const float measuredPeak =
+        ColorCubeWindow::peakRelative(&rgbaPeak, 1, 1, VK_FORMAT_R8G8B8A8_UNORM);
+    const float bluePeak =
+        ColorCubeWindow::peakRelative(&rgbaBlue, 1, 1, VK_FORMAT_R8G8B8A8_UNORM);
+    const float hdrBluePeak =
+        ColorCubeWindow::peakRelative(&hdrBlue, 1, 1, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    if (std::abs(whiteXyY.x - 0.3127f) > 0.001f ||
+        std::abs(whiteXyY.y - 0.3290f) > 0.001f ||
+        std::abs(whiteXyY.bigY - 1.0f) > 0.001f ||
+        std::abs(whiteYuv.first - 0.3122f) > 0.001f ||
+        std::abs(whiteYuv.second - 0.1978f) > 0.001f ||
+        std::abs(whiteLab.first) > 0.02f || std::abs(whiteLab.second) > 0.02f ||
+        std::abs(whiteLab.vertical - 100.0f) > 0.02f ||
+        std::abs(whiteLuv.first) > 0.02f || std::abs(whiteLuv.second) > 0.02f ||
+        std::abs(whiteLuv.vertical - 100.0f) > 0.02f ||
+        whiteLch.first != 0.0f || std::abs(whiteLch.second) > 0.02f ||
+        std::abs(whiteLch.vertical - 100.0f) > 0.02f ||
+        std::abs(redLch.first - 40.0f) > 1.0f ||
+        std::abs(redLch.second - 104.0f) > 2.0f ||
+        std::abs(blackJz.first) > 0.0001f || std::abs(blackJz.second) > 0.0001f ||
+        std::abs(blackJz.vertical) > 0.0001f ||
+        blackJzCzHz.first != 0.0f || blackJzCzHz.second != 0.0f ||
+        blackJzCzHz.vertical != 0.0f ||
+        blackPeakJz.first.minimum != 0.0f || blackPeakJz.first.maximum != 0.0f ||
+        blackPeakJz.second.minimum != 0.0f || blackPeakJz.second.maximum != 0.0f ||
+        blackPeakJz.vertical.maximum != 0.0f ||
+        !(halfPeakJz.vertical.maximum > 0.0f &&
+          halfPeakJz.vertical.maximum < fullPeakJz.vertical.maximum) ||
+        !(halfPeakJz.first.minimum > fullPeakJz.first.minimum &&
+          halfPeakJz.first.maximum < fullPeakJz.first.maximum) ||
+        std::abs(fullPeakJz.first.minimum + 0.4102f) > 0.002f ||
+        std::abs(fullPeakJz.first.maximum - 0.1824f) > 0.002f ||
+        std::abs(fullPeakJz.second.minimum + 0.3236f) > 0.002f ||
+        std::abs(fullPeakJz.second.maximum - 0.2824f) > 0.002f ||
+        std::abs(measuredPeak -
+            (0.7151686788f * decodeDisplayValue(64.0f / 255.0f, false) +
+             0.0721923154f * decodeDisplayValue(128.0f / 255.0f, false))) > 0.0001f ||
+        std::abs(bluePeak - 0.0721923154f) > 0.0001f ||
+        std::abs(hdrBluePeak - 0.0593017165f) > 0.0001f ||
+        remapColorCoordinate(0.00364f, {0.00364f, 0.73469f}) != 0.0f ||
+        remapColorCoordinate(0.73469f, {0.00364f, 0.73469f}) != 1.0f) {
+        std::cerr << "self-test failed: color cube conversion is invalid"
+                  << " Yuv=" << whiteYuv.first << ',' << whiteYuv.second
+                  << " Lab=" << whiteLab.first << ',' << whiteLab.second << ',' << whiteLab.vertical
+                  << " Luv=" << whiteLuv.first << ',' << whiteLuv.second << ',' << whiteLuv.vertical
+                  << " LCh=" << redLch.first << ',' << redLch.second << ',' << redLch.vertical
+                  << " JzPeak=" << halfPeakJz.vertical.maximum << ','
+                  << fullPeakJz.vertical.maximum
+                  << std::endl;
         return 1;
     }
     constexpr uint32_t width = 1280;
