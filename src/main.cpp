@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -398,9 +399,12 @@ class App {
 public:
     App(const fs::path& executable, const StartupOptions& options)
         : executableDir_(executable.parent_path()), initialWidth_(options.width), initialHeight_(options.height) {
+        loadSavedShaderSettings();
         createWindow();
         settingsWindow_.create(window_, [this](std::size_t setting, std::size_t value) {
             changeShaderSetting(setting, value);
+        }, [this] {
+            resetShaderSettings();
         });
         initVulkan();
         cubeRenderer_.initialize(instance_, physicalDevice_, device_, queue_, queueFamily_,
@@ -417,6 +421,7 @@ public:
     }
 
     ~App() {
+        if (shaderSettingsSavePending_) saveShaderSettings();
         commandState_->running = false;
         commandState_->window = nullptr;
         if (consoleInput_ != INVALID_HANDLE_VALUE) SetConsoleMode(consoleInput_, consoleInputMode_);
@@ -460,6 +465,7 @@ public:
             processCommands();
             processHotkeys();
             pollShader();
+            pollShaderSettingsSave();
             if (resizePending_ && !minimized_) {
                 resizePending_ = false;
                 recreateSwapchain();
@@ -943,6 +949,155 @@ private:
         ++shaderSettingsGeneration_;
     }
 
+    fs::path shaderSettingsStoragePath() const {
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+        if (length > 1) {
+            std::wstring directory(length, L'\0');
+            GetEnvironmentVariableW(L"LOCALAPPDATA", directory.data(), length);
+            directory.resize(length - 1);
+            return fs::path(directory) / L"drt-bench" / L"shader-settings.cfg";
+        }
+        return executableDir_ / "shader-settings.cfg";
+    }
+
+    static std::string shaderSettingsId(const fs::path& path) {
+        std::error_code error;
+        fs::path normalized = fs::weakly_canonical(path, error);
+        if (error) normalized = fs::absolute(path, error).lexically_normal();
+        std::string id = normalized.generic_string();
+        std::transform(id.begin(), id.end(), id.begin(), [](unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+        return id;
+    }
+
+    static std::wstring shaderSettingsMutexName(const fs::path& path) {
+        std::error_code error;
+        fs::path normalized = fs::weakly_canonical(path, error);
+        if (error) normalized = fs::absolute(path, error).lexically_normal();
+        std::wstring normalizedPath = normalized.native();
+        std::transform(normalizedPath.begin(), normalizedPath.end(), normalizedPath.begin(),
+                       [](wchar_t character) { return std::towlower(character); });
+        uint64_t hash = 1469598103934665603ull;
+        for (const wchar_t character : normalizedPath) {
+            hash ^= static_cast<uint16_t>(character);
+            hash *= 1099511628211ull;
+        }
+        wchar_t suffix[17]{};
+        swprintf_s(suffix, L"%016llx", static_cast<unsigned long long>(hash));
+        return std::wstring(L"Local\\drt-bench-shader-settings-") + suffix;
+    }
+
+    void loadSavedShaderSettings() {
+        shaderSettingsStoragePath_ = shaderSettingsStoragePath();
+        std::ifstream file(shaderSettingsStoragePath_, std::ios::binary);
+        if (!file) return;
+        savedShaderSettings_ = shader_settings::parseSavedValues(
+            std::string(std::istreambuf_iterator<char>(file), {}));
+    }
+
+    bool saveShaderSettings() noexcept {
+        try {
+            return saveShaderSettingsImpl();
+        } catch (const std::exception& exception) {
+            std::cerr << "cannot save shader settings: " << exception.what() << '\n';
+            return false;
+        } catch (...) {
+            std::cerr << "cannot save shader settings\n";
+            return false;
+        }
+    }
+
+    bool saveShaderSettingsImpl() {
+        if (shaderSettingsId_.empty()) return true;
+        std::error_code error;
+        fs::create_directories(shaderSettingsStoragePath_.parent_path(), error);
+        if (error) {
+            std::cerr << "cannot create shader settings directory: " << error.message() << '\n';
+            return false;
+        }
+
+        const std::wstring mutexName = shaderSettingsMutexName(shaderSettingsStoragePath_);
+        const std::unique_ptr<void, decltype(&CloseHandle)> mutex(
+            CreateMutexW(nullptr, FALSE, mutexName.c_str()), &CloseHandle);
+        if (!mutex) {
+            std::cerr << "cannot create shader settings mutex\n";
+            return false;
+        }
+        const DWORD wait = WaitForSingleObject(mutex.get(), 5000);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+            std::cerr << "timed out saving shader settings\n";
+            return false;
+        }
+        struct MutexRelease {
+            HANDLE handle;
+            ~MutexRelease() { ReleaseMutex(handle); }
+        } release{mutex.get()};
+
+        const bool saved = [&] {
+            shader_settings::SavedValues merged;
+            {
+                std::ifstream existing(shaderSettingsStoragePath_, std::ios::binary);
+                if (existing) {
+                    merged = shader_settings::parseSavedValues(
+                        std::string(std::istreambuf_iterator<char>(existing), {}));
+                } else {
+                    std::error_code existsError;
+                    if (fs::exists(shaderSettingsStoragePath_, existsError) || existsError) {
+                        std::cerr << "cannot read saved shader settings\n";
+                        return false;
+                    }
+                }
+            }
+            shader_settings::updateSavedValues(shaderSettings_, shaderSettingsId_, merged);
+            const std::string serialized = shader_settings::serializeSavedValues(merged);
+            fs::path temporary = shaderSettingsStoragePath_;
+            temporary += L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp";
+            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+            if (!file) {
+                std::cerr << "cannot save shader settings\n";
+                return false;
+            }
+            file.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
+            file.flush();
+            file.close();
+            if (!file) {
+                DeleteFileW(temporary.c_str());
+                std::cerr << "cannot finish saving shader settings\n";
+                return false;
+            }
+            if (!MoveFileExW(temporary.c_str(), shaderSettingsStoragePath_.c_str(),
+                             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                DeleteFileW(temporary.c_str());
+                std::cerr << "cannot replace saved shader settings\n";
+                return false;
+            }
+            savedShaderSettings_ = std::move(merged);
+            return true;
+        }();
+        return saved;
+    }
+
+    void scheduleShaderSettingsSave() {
+        shaderSettingsSavePending_ = true;
+        shaderSettingsSaveDue_ = Clock::now() + 300ms;
+    }
+
+    void flushShaderSettingsSave() {
+        if (!shaderSettingsSavePending_) return;
+        if (saveShaderSettings()) {
+            shaderSettingsSavePending_ = false;
+        } else {
+            shaderSettingsSaveDue_ = Clock::now() + 1s;
+        }
+    }
+
+    void pollShaderSettingsSave() {
+        if (shaderSettingsSavePending_ && Clock::now() >= shaderSettingsSaveDue_) {
+            flushShaderSettingsSave();
+        }
+    }
+
     void createShaderSettingsBuffers() {
         destroyShaderSettingsBuffers();
         if (descriptorSets_.empty() || shaderSettingValues_.empty()) return;
@@ -1034,13 +1189,34 @@ private:
                 settingsWindow_.setSettings(shaderSettings_);
                 return;
             }
-            std::cout << "setting " << shaderSettings_[setting].name << " = "
-                      << shaderSettings_[setting].valueTokens[value]
-                      << " (shader recompiled)\n";
+            scheduleShaderSettingsSave();
             return;
         }
         uploadShaderSettings();
         dirty_ = true;
+        scheduleShaderSettingsSave();
+    }
+
+    void resetShaderSettings() {
+        const std::vector<shader_settings::Setting> previous = shaderSettings_;
+        bool compileTimeChanged = false;
+        for (auto& setting : shaderSettings_) {
+            compileTimeChanged = compileTimeChanged ||
+                (setting.compileTime && setting.selected != setting.defaultSelected);
+            setting.selected = setting.defaultSelected;
+        }
+        if (compileTimeChanged && !loadShader(shaderPath_, true)) {
+            shaderSettings_ = previous;
+            settingsWindow_.setSettings(shaderSettings_);
+            return;
+        }
+        if (!compileTimeChanged) {
+            uploadShaderSettings();
+            settingsWindow_.setSettings(shaderSettings_);
+            dirty_ = true;
+        }
+        scheduleShaderSettingsSave();
+        flushShaderSettingsSave();
     }
 
     void uploadTexture(const void* pixels, size_t byteCount, uint32_t width, uint32_t height, VkFormat format) {
@@ -1170,7 +1346,12 @@ private:
             compiledSettings = shader_settings::parse(entrySource);
             shader_settings::localize(compiledSettings,
                                       shader_settings::englishLanguagePath(includeRoot));
-            shader_settings::preserveSelections(compiledSettings, shaderSettings_);
+            const std::string compiledShaderId = shaderSettingsId(path);
+            shader_settings::applySavedValues(
+                compiledSettings, compiledShaderId, savedShaderSettings_);
+            if (compiledShaderId == shaderSettingsId_) {
+                shader_settings::preserveSelections(compiledSettings, shaderSettings_);
+            }
             std::string source =
                 expandShaderIncludes(path, includeRoot, {}, &path, &compiledSettings);
             source = shader_settings::patch(source, compiledSettings);
@@ -1257,15 +1438,25 @@ private:
             std::cout << "shader reload queued (500ms cooldown)\n";
             return true;
         }
+        const fs::path requestedPath = fs::absolute(path);
+        const std::string requestedSettingsId = shaderSettingsId(requestedPath);
+        if (shaderSettingsSavePending_ && requestedSettingsId != shaderSettingsId_) {
+            flushShaderSettingsSave();
+            if (shaderSettingsSavePending_) {
+                std::cerr << "shader change postponed because settings could not be saved\n";
+                return false;
+            }
+        }
         VkPipeline replacement = VK_NULL_HANDLE;
         std::vector<shader_settings::Setting> replacementSettings;
-        shaderPath_ = fs::absolute(path);
+        shaderPath_ = requestedPath;
         const bool compiled = compilePipeline(shaderPath_, shaderIncludeRoot_, hdr_,
                                               replacement, replacementSettings);
         lastShaderReload_ = std::chrono::steady_clock::now();
         if (!compiled) return false;
         vkDeviceWaitIdle(device_);
         replaceShaderSettings(std::move(replacementSettings));
+        shaderSettingsId_ = shaderSettingsId(shaderPath_);
         if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
         pipeline_ = replacement;
         shaderReloadPending_ = false;
@@ -1682,15 +1873,27 @@ private:
     }
 
     void loadShaderDirectory(const fs::path& directory) {
-        shaderDirectory_ = fs::absolute(directory);
-        shaderIncludeRoot_ = shaderDirectory_;
-        shaderPath_ = shaderDirectory_ / "main.glsl";
+        const fs::path candidateDirectory = fs::absolute(directory);
+        const fs::path candidatePath = candidateDirectory / "main.glsl";
         std::error_code error;
-        if (!fs::is_regular_file(shaderPath_, error) || error) {
-            throw std::runtime_error("DRT shader entry point is missing: " + shaderPath_.string());
+        if (!fs::is_regular_file(candidatePath, error) || error) {
+            throw std::runtime_error("DRT shader entry point is missing: " + candidatePath.string());
         }
-        observedShaderFiles_ = shaderFileSnapshot(shaderDirectory_);
-        loadShader(shaderPath_, true);
+        const auto candidateFiles = shaderFileSnapshot(candidateDirectory);
+        const fs::path previousDirectory = shaderDirectory_;
+        const fs::path previousIncludeRoot = shaderIncludeRoot_;
+        const fs::path previousPath = shaderPath_;
+        const auto previousFiles = observedShaderFiles_;
+        shaderDirectory_ = candidateDirectory;
+        shaderIncludeRoot_ = candidateDirectory;
+        shaderPath_ = candidatePath;
+        observedShaderFiles_ = candidateFiles;
+        if (!loadShader(candidatePath, true)) {
+            shaderDirectory_ = previousDirectory;
+            shaderIncludeRoot_ = previousIncludeRoot;
+            shaderPath_ = previousPath;
+            observedShaderFiles_ = previousFiles;
+        }
     }
 
     void processHotkeys() {
@@ -1779,6 +1982,7 @@ private:
             throw;
         }
         replaceShaderSettings(std::move(compiledSettings));
+        shaderSettingsId_ = shaderSettingsId(shaderPath_);
         vkDestroyPipeline(device_, pipeline_, nullptr);
         pipeline_ = replacement;
         dirty_ = true;
@@ -1797,6 +2001,11 @@ private:
     GpuCubeRenderer cubeRenderer_;
     ShaderSettingsWindow settingsWindow_;
     std::vector<shader_settings::Setting> shaderSettings_;
+    std::string shaderSettingsId_;
+    shader_settings::SavedValues savedShaderSettings_;
+    fs::path shaderSettingsStoragePath_;
+    bool shaderSettingsSavePending_ = false;
+    Clock::time_point shaderSettingsSaveDue_{};
     std::shared_ptr<CommandState> commandState_ = std::make_shared<CommandState>();
     HANDLE consoleInput_ = INVALID_HANDLE_VALUE;
     DWORD consoleInputMode_ = 0;
@@ -2025,7 +2234,8 @@ int selfTest() {
         "value.TEST_GAIN.1.0=full\n"));
     const std::string patched = shader_settings::patch(settingsSource, settings);
     const auto packed = shader_settings::packedValues(settings);
-    if (settings.size() != 2 || settings[0].selected != 2 || settings[1].selected != 1 ||
+    if (settings.size() != 2 || settings[0].selected != 2 ||
+        settings[0].defaultSelected != 2 || settings[1].selected != 1 ||
         settings[0].label != "Localized Gain" ||
         settings[0].comment != "Controls the test gain." ||
         shader_settings::displayValue(settings[0]) != "2^-full stops" ||
@@ -2038,8 +2248,24 @@ int selfTest() {
         std::cerr << "self-test failed: Iris-style shader setting parsing is invalid\n";
         return 1;
     }
-    auto reloadedSettings = shader_settings::parse(settingsSource);
+    shader_settings::SavedValues savedValues;
     settings[0].selected = 1;
+    shader_settings::updateSavedValues(settings, "test/main.glsl", savedValues);
+    const std::string savedText = shader_settings::serializeSavedValues(savedValues);
+    const auto parsedSavedValues = shader_settings::parseSavedValues(savedText);
+    auto restoredSettings = shader_settings::parse(settingsSource);
+    shader_settings::applySavedValues(restoredSettings, "test/main.glsl", parsedSavedValues);
+    if (restoredSettings[0].selected != 1 || restoredSettings[1].selected != 1) {
+        std::cerr << "self-test failed: shader setting persistence round trip is invalid\n";
+        return 1;
+    }
+    restoredSettings[0].selected = restoredSettings[0].defaultSelected;
+    shader_settings::updateSavedValues(restoredSettings, "test/main.glsl", savedValues);
+    if (!savedValues.empty()) {
+        std::cerr << "self-test failed: default shader settings remain persisted\n";
+        return 1;
+    }
+    auto reloadedSettings = shader_settings::parse(settingsSource);
     shader_settings::preserveSelections(reloadedSettings, settings);
     if (reloadedSettings[0].selected != 1) {
         std::cerr << "self-test failed: shader setting selection was not preserved\n";

@@ -7,12 +7,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -30,6 +32,7 @@ struct Setting {
     std::vector<float> values;
     std::unordered_map<std::string, std::string> valueLabels;
     std::size_t selected = 0;
+    std::size_t defaultSelected = 0;
     bool integer = false;
     bool compileTime = false;
 };
@@ -114,6 +117,7 @@ inline std::optional<Setting> parseLine(std::string_view line) {
         throw std::runtime_error("shader setting default is not in its value list: " + name);
     }
     setting.selected = static_cast<std::size_t>(selected - setting.values.begin());
+    setting.defaultSelected = setting.selected;
     return setting;
 }
 
@@ -215,6 +219,73 @@ inline void preserveSelections(std::vector<Setting>& settings, const std::vector
             setting.selected = static_cast<std::size_t>(current - setting.valueTokens.begin());
         }
     }
+}
+
+using SavedValues =
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>>;
+
+inline SavedValues parseSavedValues(std::string_view source) {
+    SavedValues saved;
+    std::istringstream lines{std::string(source)};
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::istringstream fields(line);
+        std::string shader;
+        std::string name;
+        std::string token;
+        std::string extra;
+        if (!(fields >> std::quoted(shader) >> std::quoted(name) >> std::quoted(token)) ||
+            fields >> extra) {
+            continue;
+        }
+        saved[shader][name] = token;
+    }
+    return saved;
+}
+
+inline std::string serializeSavedValues(const SavedValues& saved) {
+    std::vector<std::tuple<std::string, std::string, std::string>> entries;
+    for (const auto& [shader, settings] : saved) {
+        for (const auto& [name, token] : settings) {
+            entries.emplace_back(shader, name, token);
+        }
+    }
+    std::sort(entries.begin(), entries.end());
+    std::ostringstream output;
+    for (const auto& [shader, name, token] : entries) {
+        output << std::quoted(shader) << ' ' << std::quoted(name) << ' '
+               << std::quoted(token) << '\n';
+    }
+    return output.str();
+}
+
+inline void applySavedValues(
+    std::vector<Setting>& settings, std::string_view shader, const SavedValues& saved) {
+    const auto shaderValues = saved.find(std::string(shader));
+    if (shaderValues == saved.end()) return;
+    for (Setting& setting : settings) {
+        const auto savedToken = shaderValues->second.find(setting.name);
+        if (savedToken == shaderValues->second.end()) continue;
+        const auto token = std::find(
+            setting.valueTokens.begin(), setting.valueTokens.end(), savedToken->second);
+        if (token != setting.valueTokens.end()) {
+            setting.selected = static_cast<std::size_t>(token - setting.valueTokens.begin());
+        }
+    }
+}
+
+inline void updateSavedValues(
+    const std::vector<Setting>& settings, std::string_view shader, SavedValues& saved) {
+    std::unordered_map<std::string, std::string> shaderValues;
+    for (const Setting& setting : settings) {
+        if (setting.selected < setting.valueTokens.size() &&
+            setting.selected != setting.defaultSelected) {
+            shaderValues[setting.name] = setting.valueTokens[setting.selected];
+        }
+    }
+    const std::string shaderId(shader);
+    if (shaderValues.empty()) saved.erase(shaderId);
+    else saved[shaderId] = std::move(shaderValues);
 }
 
 inline bool containsIdentifier(std::string_view text, std::string_view identifierText) {
