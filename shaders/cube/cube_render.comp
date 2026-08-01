@@ -230,7 +230,7 @@ vec2 labelAnchor(uint label, uint length) {
 }
 
 bool overlayColorAt(vec2 pixel, out vec3 color) {
-    const int scale = 2;
+    const int scale = 1;
     for (uint label = 0u; label < 6u; ++label) {
         const uint length = labelLength(label);
         const vec2 anchor = labelAnchor(label, length);
@@ -308,8 +308,8 @@ void main() {
     const vec3 coordinate = normalizeCoordinates(
         rawCoordinates(parameters.meta.x, displayRgb, parameters.source.w != 0.0));
     const ivec2 target = ivec2(round(screenPoint(coordinate)));
-    for (int y = 0; y < 2; ++y) {
-        for (int x = 0; x < 2; ++x) {
+    for (int y = 0; y < 1; ++y) {
+        for (int x = 0; x < 1; ++x) {
             const ivec2 pixel = target + ivec2(x, y);
             if (all(greaterThanEqual(pixel, ivec2(0))) && all(lessThan(pixel, outputSize))) {
                 atomicMax(pointPixels.values[uint(pixel.y * outputSize.x + pixel.x)],

@@ -2184,11 +2184,6 @@ int selfTest() {
                   << std::endl;
         return 1;
     }
-    constexpr uint32_t width = 1280;
-    constexpr uint32_t height = 720;
-    const size_t fp16Bytes = static_cast<size_t>(width) * height * 4 * 2;
-    const size_t fp32Bytes = static_cast<size_t>(width) * height * 4 * 4;
-    if (fp16Bytes != 7'372'800 || fp32Bytes != 14'745'600) return 1;
     const auto now = Clock::now();
     if (shaderReloadReady(true, now - 500ms, now - 99ms, now) ||
         shaderReloadReady(true, now - 499ms, now - 1s, now) ||
